@@ -1,0 +1,38 @@
+rb2engine
+Copyright (c) 2026 jrgutier
+
+This product includes and references third-party work as follows.
+
+---------------------------------------------------------------------------
+crate-digger (EPL-2.0)
+---------------------------------------------------------------------------
+
+rb2engine vendors a Python parser generated from the Kaitai Struct
+definition `rekordbox_pdb.ksy` originally published by the crate-digger
+project (Deep Symmetry, LLC and contributors).
+
+  Project: https://github.com/Deep-Symmetry/crate-digger
+  License: Eclipse Public License 2.0 (EPL-2.0)
+
+The generated module lives under `src/rb2engine/reader/_vendor/` together
+with a copy of the EPL-2.0 license text. That file is subject to EPL-2.0
+only; EPL-2.0 is file-scoped and does not relicense the rest of rb2engine
+(MIT). When regenerating the parser:
+
+  kaitai-struct-compiler -t python rekordbox_pdb.ksy
+
+Do not copy other crate-digger source into this tree.
+
+---------------------------------------------------------------------------
+libdjinterop (LGPL-3.0) — documentation only
+---------------------------------------------------------------------------
+
+libdjinterop (https://github.com/xsco/libdjinterop) is used solely as a
+reference for the Engine DJ SQLite schema and PerformanceData blob layouts.
+
+  License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+
+No libdjinterop source code, headers, object code, or linked binary is
+included in, generated into, or linked against rb2engine. Schema DDL
+committed under `src/rb2engine/writer/ddl/` is captured from Engine DJ's
+own output, not copied from libdjinterop.
