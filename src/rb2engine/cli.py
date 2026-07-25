@@ -169,6 +169,16 @@ def inspect_cmd(
     ctx.exit(0)
 
 
+def _progress_stream() -> Any:
+    """The stream the progress bar draws on.
+
+    Indirected through a function so tests can inject a stream whose
+    ``isatty()`` they control; ``sys.stderr`` is resolved at call time rather
+    than at import so a caller that replaces it still gets the real one.
+    """
+    return sys.stderr
+
+
 def _emit_report(
     report: ConversionReport,
     drive: Path | None,
@@ -244,7 +254,8 @@ def convert_cmd(
 
     # Imported lazily so `--help` and `--version` stay fast and do not pull in
     # the parser/writer stack.
-    from rb2engine.reader.library import read_library
+    import rb2engine.reader.library as reader_library
+    from rb2engine.progress import ProgressReporter
     from rb2engine.report import ConversionReport
     from rb2engine.writer.build import build_library
 
@@ -262,11 +273,26 @@ def convert_cmd(
             )
         schema = (parts[0], parts[1], parts[2])
 
+    # A big stick spends minutes opening files; without this a running
+    # conversion is indistinguishable from a hung one. Disabled under
+    # --log-json, which owns stderr, and off a terminal, where a \r-redrawn
+    # bar would turn a redirected log into one unreadable line.
+    progress = ProgressReporter(
+        _progress_stream(),
+        enabled=False if ctx.obj.get("log_json") else None,
+    )
+
     report = ConversionReport()
     try:
-        library = read_library(drive, with_anlz=True, with_artwork=not no_artwork)
+        library = reader_library.read_library(
+            drive,
+            with_anlz=True,
+            with_artwork=not no_artwork,
+            on_progress=progress,
+        )
 
         if dry_run:
+            progress.close()
             click.echo(
                 f"dry run: {len(library.tracks)} tracks, "
                 f"{len(library.playlists)} playlists — nothing written"
@@ -281,17 +307,23 @@ def convert_cmd(
             target_schema=schema,
             database_uuid=database_uuid,
             with_artwork=not no_artwork,
+            on_progress=progress,
         )
     except UnsupportedFormatError as exc:
+        progress.close()
         click.echo(f"unsupported: {exc}", err=True)
         report.fatal, report.fatal_message = True, str(exc)
         _emit_report(report, drive, report_path)
         ctx.exit(2)
     except FatalError as exc:
+        progress.close()
         click.echo(f"conversion failed: {exc}", err=True)
         report.fatal, report.fatal_message = True, str(exc)
         _emit_report(report, drive, report_path)
         ctx.exit(2)
+    finally:
+        # Also covers ctx.exit() on the dry-run path, which raises internally.
+        progress.close()
 
     _emit_report(report, drive, report_path)
     counters = report.counters

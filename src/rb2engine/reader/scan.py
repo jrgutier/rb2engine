@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from rb2engine.errors import UnsupportedFormatError
+from rb2engine.reader.paths import fold_name
 
 logger = logging.getLogger(__name__)
 
@@ -182,13 +183,17 @@ def resolve_anlz_paths(drive_root: Path, anlz_path: str) -> AnlzPaths:
 
 
 def _find_child(parent: Path, name: str) -> Path | None:
-    """Return the child of ``parent`` whose name matches ``name`` case-insensitively."""
+    """Return the child of ``parent`` whose name matches ``name`` case-insensitively.
+
+    Matching is also insensitive to Unicode normalization form — see
+    :func:`rb2engine.reader.paths.fold_name`.
+    """
     if not parent.is_dir():
         return None
-    target = name.lower()
+    target = fold_name(name)
     try:
         for entry in parent.iterdir():
-            if entry.name.lower() == target:
+            if fold_name(entry.name) == target:
                 return entry
     except OSError:
         return None

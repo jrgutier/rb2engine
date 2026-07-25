@@ -14,7 +14,28 @@ Never mix the two.
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path, PurePosixPath
+
+
+def fold_name(name: str) -> str:
+    """Comparison key for one filename segment: case- and NFC-normalized.
+
+    WHY NORMALIZATION IS REQUIRED
+    -----------------------------
+    export.pdb stores ``São Paulo - Single`` composed (NFC: U+00E3), while the
+    same directory read back off the stick with ``iterdir()`` comes out
+    decomposed (NFD: ``a`` + U+0303). They are the same name to every human and
+    to the filesystem, but different ``str`` objects, so a bare ``.lower()``
+    comparison misses.
+
+    This is not a corner case: it silently dropped 46 of 3,666 tracks on a real
+    library — every track whose path contained an accented character. The
+    filesystem hides it, because macOS resolves an NFC path against NFD
+    on-disk names inside the syscall; only our own iterdir()-and-compare walk
+    sees the difference, which is exactly why it went unnoticed.
+    """
+    return unicodedata.normalize("NFC", name).lower()
 
 
 def resolve_track_path(raw_path: str, drive_root: Path) -> Path | None:
@@ -52,7 +73,7 @@ def resolve_track_path(raw_path: str, drive_root: Path) -> Path | None:
     contents_idx: int | None = None
     for i, segment in enumerate(segments):
         # Full segment match only — "MyContentsMix" / "ContentsExtra" must not hit.
-        if segment.lower() == "contents":
+        if fold_name(segment) == "contents":
             contents_idx = i
             break
 
@@ -69,8 +90,9 @@ def resolve_track_path(raw_path: str, drive_root: Path) -> Path | None:
 def _resolve_case_insensitive(root: Path, segments: list[str]) -> Path | None:
     """Walk ``segments`` under ``root``, matching each name case-insensitively.
 
-    Returns the path using on-disk casing so open() works on case-sensitive
-    hosts when the volume is FAT32 (case-insensitive) but the host is not.
+    Returns the path using on-disk casing **and on-disk Unicode normalization**,
+    so the caller opens the name the filesystem actually holds. See
+    :func:`fold_name` for why the comparison cannot be a bare ``.lower()``.
     """
     current = root
     for segment in segments:
@@ -82,9 +104,9 @@ def _resolve_case_insensitive(root: Path, segments: list[str]) -> Path | None:
             return None
 
         match: Path | None = None
-        target = segment.lower()
+        target = fold_name(segment)
         for entry in entries:
-            if entry.name.lower() == target:
+            if fold_name(entry.name) == target:
                 match = entry
                 break
         if match is None:

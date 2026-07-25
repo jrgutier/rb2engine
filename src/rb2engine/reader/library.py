@@ -19,6 +19,7 @@ import dataclasses
 from pathlib import Path
 
 from rb2engine.ir import SourceLibrary, SourceTrack
+from rb2engine.progress import ProgressCallback
 from rb2engine.reader.anlz import read_anlz
 from rb2engine.reader.artwork import extract_artwork
 from rb2engine.reader.pdb import parse_export_pdb
@@ -30,6 +31,7 @@ def read_library(
     *,
     with_anlz: bool = True,
     with_artwork: bool = True,
+    on_progress: ProgressCallback | None = None,
 ) -> SourceLibrary:
     """Read a rekordbox stick into a fully-populated `SourceLibrary`.
 
@@ -45,9 +47,17 @@ def read_library(
     with_artwork:
         Extract embedded album art. Disable for speed — it opens every audio
         file, which dominates runtime on a large library.
+    on_progress:
+        Optional ``(phase, done, total)`` sink. The per-track loop below opens
+        two or three files per track over USB, so on a real library this is
+        the difference between a visible conversion and a silent one.
     """
     drive_root = Path(drive_root)
     layout = scan_drive(drive_root)
+
+    if on_progress is not None:
+        # Indeterminate: the pdb page count is not known until it is parsed.
+        on_progress("scanning", 0, 0)
 
     lib = parse_export_pdb(layout.export_pdb, drive_root)
     warnings = list(lib.warnings)
@@ -63,7 +73,10 @@ def read_library(
         return dataclasses.replace(lib, warnings=warnings)
 
     tracks: dict[int, SourceTrack] = {}
-    for tid, track in lib.tracks.items():
+    total = len(lib.tracks)
+    if on_progress is not None:
+        on_progress("reading tracks", 0, total)
+    for done, (tid, track) in enumerate(lib.tracks.items(), start=1):
         beatgrid = track.beatgrid
         cues = track.cues
         artwork = track.artwork
@@ -89,5 +102,7 @@ def read_library(
         tracks[tid] = dataclasses.replace(
             track, beatgrid=beatgrid, cues=cues, artwork=artwork
         )
+        if on_progress is not None:
+            on_progress("reading tracks", done, total)
 
     return dataclasses.replace(lib, tracks=tracks, warnings=warnings)

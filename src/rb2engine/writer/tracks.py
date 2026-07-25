@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from rb2engine.ir_engine import EngineTrack
+from rb2engine.progress import ItemCallback
 from rb2engine.writer.blobs import (
     BeatData,
     BeatGrid,
@@ -274,6 +275,7 @@ def insert_tracks(
     tracks: Sequence[EngineTrack],
     *,
     art_ids: Mapping[str, int] | None = None,
+    on_progress: ItemCallback | None = None,
 ) -> dict[int, int]:
     """INSERT INTO Track, then UPDATE PerformanceData (trigger-created rows).
 
@@ -285,7 +287,8 @@ def insert_tracks(
     is the key. pdbImportKey is also set from rb_id when available.
     """
     id_map: dict[int, int] = {}
-    for track in tracks:
+    total = len(tracks)
+    for done, track in enumerate(tracks, start=1):
         track_id = _insert_one_track(conn, track, art_ids=art_ids)
         # Trigger must have created PerformanceData; only UPDATE.
         exists = conn.execute(
@@ -303,4 +306,6 @@ def insert_tracks(
         rb_id = getattr(track, "rb_id", None)
         rb_id = track_id if rb_id is None else int(rb_id)
         id_map[rb_id] = track_id
+        if on_progress is not None:
+            on_progress(done, total)
     return id_map

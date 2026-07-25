@@ -68,12 +68,24 @@ rb2engine convert /Volumes/MY_USB
 # Confirm the conversion is faithful, track by track
 rb2engine verify /Volumes/MY_USB
 
+
+
 # See what would happen without writing
 rb2engine convert /Volumes/MY_USB --dry-run
 
 # Skip artwork (much faster — artwork reads every audio file)
 rb2engine convert /Volumes/MY_USB --no-artwork
 ```
+
+A conversion of a full stick takes minutes, so `convert` reports each phase as
+it goes:
+
+```
+reading tracks ▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  30%
+```
+
+Progress goes to stderr and switches itself off when stderr is redirected or
+`--log-json` is set, so piping stays clean.
 
 ### Commands
 
@@ -204,7 +216,7 @@ Positions are integer sample counts throughout; the millisecond conversion happe
 
 ```bash
 uv sync
-uv run pytest          # ~475 tests
+uv run pytest          # ~680 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

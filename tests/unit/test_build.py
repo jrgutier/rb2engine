@@ -129,7 +129,15 @@ def _install_pipeline_fakes(
         path = f"../Contents/track_{src.rb_id}.mp3"
         return _minimal_engine_track(path=path)
 
-    def insert_artwork(conn: sqlite3.Connection, arts: Sequence[Any]) -> dict[str, int]:
+    # ``on_progress`` is accepted and ignored: these doubles stand in for the
+    # real writers, and a double that rejects an argument the real function
+    # takes fails the build for a reason the production code does not have.
+    def insert_artwork(
+        conn: sqlite3.Connection,
+        arts: Sequence[Any],
+        *,
+        on_progress: Any = None,
+    ) -> dict[str, int]:
         return {}
 
     def insert_tracks(
@@ -137,6 +145,7 @@ def _install_pipeline_fakes(
         tracks: Sequence[EngineTrack],
         *,
         art_ids: Mapping[str, int] | None = None,
+        on_progress: Any = None,
     ) -> dict[int, int]:
         if fail_after_tmp:
             raise RuntimeError("simulated mid-write failure")
@@ -1106,6 +1115,7 @@ def test_positional_track_id_map_is_realigned_to_rb_ids(
         tracks: Sequence[EngineTrack],
         *,
         art_ids: Mapping[str, int] | None = None,
+        on_progress: Any = None,
     ) -> dict[int, int]:
         out: dict[int, int] = {}
         for i, et in enumerate(tracks):
@@ -1163,6 +1173,7 @@ def test_empty_track_id_map_does_not_invent_ids(
         tracks: Sequence[EngineTrack],
         *,
         art_ids: Mapping[str, int] | None = None,
+        on_progress: Any = None,
     ) -> dict[int, int]:
         # Writer bug simulation: inserts nothing, returns empty.
         return {}

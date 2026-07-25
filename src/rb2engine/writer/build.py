@@ -28,6 +28,7 @@ from pathlib import Path
 from rb2engine.errors import FatalError
 from rb2engine.ir import SourceArtwork, SourceLibrary
 from rb2engine.ir_engine import EngineTrack
+from rb2engine.progress import ProgressCallback, phase_callback
 from rb2engine.report import ConversionReport
 
 logger = logging.getLogger(__name__)
@@ -149,10 +150,14 @@ def build_library(
     target_schema: tuple[int, int, int] | None = None,
     database_uuid: str | None = None,
     with_artwork: bool = True,
+    on_progress: ProgressCallback | None = None,
 ) -> Path:
     """Orchestrate a full m.db write and return the final m.db path.
 
     See module docstring for the swap protocol and preservation rules.
+
+    *on_progress* is an optional ``(phase, done, total)`` sink; ``total <= 0``
+    marks a phase whose size is not known in advance.
     """
     drive_root = Path(drive_root)
     report.path_base = path_base
@@ -237,7 +242,9 @@ def build_library(
             if arts:
                 from rb2engine.writer import artwork as artwork_mod
 
-                art_ids = artwork_mod.insert_artwork(conn, arts)
+                art_ids = artwork_mod.insert_artwork(
+                    conn, arts, on_progress=phase_callback(on_progress, "album art")
+                )
 
         # --- map + insert tracks -----------------------------------------------
         from rb2engine.mapper.track import map_track
@@ -245,7 +252,10 @@ def build_library(
 
         engine_tracks: list[EngineTrack] = []
         rb_order: list[int] = []
-        for rb_id in sorted(lib.tracks.keys()):
+        n_source = len(lib.tracks)
+        for mapped, rb_id in enumerate(sorted(lib.tracks.keys()), start=1):
+            if on_progress is not None:
+                on_progress("mapping", mapped, n_source)
             src = lib.tracks[rb_id]
             if src.resolved_path is None:
                 report.add_skip(
@@ -274,7 +284,10 @@ def build_library(
             rb_order.append(rb_id)
 
         track_id_map = tracks_mod.insert_tracks(
-            conn, engine_tracks, art_ids=art_ids or None
+            conn,
+            engine_tracks,
+            art_ids=art_ids or None,
+            on_progress=phase_callback(on_progress, "writing tracks"),
         )
         # If insert_tracks returned empty but we had tracks, synthesise from order
         # only when the implementation used positional ids (defensive). Prefer
@@ -300,6 +313,8 @@ def build_library(
             }
 
         # --- playlists ---------------------------------------------------------
+        if on_progress is not None:
+            on_progress("playlists", 0, 0)
         n_playlists = insert_playlists(
             conn, lib.playlists, track_id_map=track_id_map or {}
         )
@@ -314,6 +329,10 @@ def build_library(
         # Move the finished database onto the target volume as m.db.tmp, then
         # atomically replace. shutil.copyfile writes a plain byte stream, which
         # the FAT32 driver handles fine.
+        # Indeterminate: a half-gigabyte database crossing USB is the single
+        # longest step of a large conversion, and copyfile reports nothing.
+        if on_progress is not None:
+            on_progress("publishing", 0, 0)
         shutil.copyfile(stage_path, tmp_path)
         shutil.rmtree(stage_dir, ignore_errors=True)
 
