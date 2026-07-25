@@ -92,6 +92,12 @@ class SourceTrack:
     beatgrid: SourceBeatgrid | None
     cues: list[SourceCue]
     artwork: SourceArtwork | None
+    analyze_path: str | None = None
+    """pdb ofs_strings[14] — locates this track's ANLZ files (grid/cues).
+
+    Defaulted and last so existing constructions stay valid; a dataclass field
+    with a default may not precede fields without one.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +223,7 @@ def _track_to_json(track: SourceTrack, drive_root: Path) -> dict[str, Any]:
         "total_samples": track.total_samples,
         "raw_path": track.raw_path,
         "resolved_path": _canon_path(track.resolved_path, drive_root),
+        "analyze_path": track.analyze_path,
         "beatgrid": _beatgrid_to_json(track.beatgrid),
         "cues": [_cue_to_json(c) for c in track.cues],
         "artwork": _artwork_to_json(track.artwork, drive_root),

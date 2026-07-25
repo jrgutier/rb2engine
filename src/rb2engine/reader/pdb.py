@@ -88,6 +88,7 @@ PAGE_HEADER_SIZE = 40
 ROW_GROUP_SIZE = 0x24  # 16 × u2 offsets + present u2 + transaction u2
 
 # Track string-offset indices (ksy track_row.ofs_strings)
+_STR_ANALYZE_PATH = 14  # ANLZ file location — the join to beatgrids/cues
 _STR_COMMENT = 16
 _STR_TITLE = 17
 _STR_FILENAME = 19
@@ -434,6 +435,7 @@ def _parse_track_row(page: bytes, row_base: int) -> dict:
         "year": year,
         "duration": duration,
         "rating": rating,
+        "analyze_path": s(_STR_ANALYZE_PATH),
         "comment": s(_STR_COMMENT),
         "title": s(_STR_TITLE),
         "filename": s(_STR_FILENAME),
@@ -619,6 +621,7 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
                     total_samples=total_samples,
                     raw_path=raw_path,
                     resolved_path=resolved,
+                    analyze_path=raw["analyze_path"] or None,
                     beatgrid=None,
                     cues=[],
                     artwork=None,
