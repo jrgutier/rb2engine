@@ -16,8 +16,8 @@ Safety boundary — this is the ONLY module that writes to the user's stick:
 
 from __future__ import annotations
 
-import logging
 import contextlib
+import logging
 import os
 import shutil
 import sqlite3
