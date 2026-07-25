@@ -9,14 +9,18 @@ from running verify and pasting its output.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from rb2engine.errors import FatalError, UnsupportedFormatError
 from rb2engine.ir import (
     RGB,
     CueKind,
+    SourceArtwork,
     SourceBeat,
     SourceBeatgrid,
     SourceCue,
@@ -25,6 +29,18 @@ from rb2engine.ir import (
     SourceTrack,
 )
 from rb2engine.report import ConversionReport
+from rb2engine.writer.blobs import (
+    Color,
+    QuickCue,
+    decode_beat_data,
+    decode_loops,
+    decode_quick_cues,
+    decode_track_data,
+    encode_beat_data,
+    encode_loops,
+    encode_quick_cues,
+    encode_track_data,
+)
 from rb2engine.writer.build import build_library
 
 # ---------------------------------------------------------------------------
@@ -49,6 +65,7 @@ def _source_track(
     bpm: float = BPM,
     key_name: str = "Am",
     cues: list[SourceCue] | None = None,
+    artwork: SourceArtwork | None = None,
 ) -> SourceTrack:
     audio = drive / "Contents" / filename
     audio.parent.mkdir(parents=True, exist_ok=True)
@@ -100,21 +117,47 @@ def _source_track(
                 name="Loop",
             ),
         ],
-        artwork=None,
+        artwork=artwork,
     )
 
 
-def _build_fixture(tmp_path: Path) -> tuple[Path, SourceLibrary, Path]:
+def _build_fixture(
+    tmp_path: Path, *, with_artwork: bool = False
+) -> tuple[Path, SourceLibrary, Path]:
     """Build a 3-track library with one playlist into tmp_path; return drive, lib, m.db."""
     drive = tmp_path / "stick"
     drive.mkdir()
     (drive / "Contents").mkdir()
     (drive / "PIONEER").mkdir()
 
+    artwork: SourceArtwork | None = None
+    if with_artwork:
+        # Minimal valid 1×1 PNG so insert_artwork can load bytes.
+        art_file = drive / "cover.png"
+        art_file.write_bytes(
+            bytes.fromhex(
+                "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+                "0000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
+            )
+        )
+        from rb2engine.ir_engine import artwork_content_hash
+
+        artwork = SourceArtwork(
+            content_key=artwork_content_hash(art_file.read_bytes()),
+            path=art_file,
+            source="pdb",
+        )
+
     tracks = {
-        10: _source_track(10, drive=drive, title="Alpha", filename="a.mp3", bpm=120.0),
-        20: _source_track(20, drive=drive, title="Beta", filename="b.mp3", bpm=128.0),
-        30: _source_track(30, drive=drive, title="Gamma", filename="c.mp3", bpm=130.0),
+        10: _source_track(
+            10, drive=drive, title="Alpha", filename="a.mp3", bpm=120.0, artwork=artwork
+        ),
+        20: _source_track(
+            20, drive=drive, title="Beta", filename="b.mp3", bpm=128.0, artwork=artwork
+        ),
+        30: _source_track(
+            30, drive=drive, title="Gamma", filename="c.mp3", bpm=130.0, artwork=artwork
+        ),
     }
     playlists = [
         SourcePlaylist(
@@ -130,7 +173,7 @@ def _build_fixture(tmp_path: Path) -> tuple[Path, SourceLibrary, Path]:
         drive_root=drive, tracks=tracks, playlists=playlists, warnings=[]
     )
     m_db = build_library(
-        lib, drive_root=drive, report=ConversionReport(), with_artwork=False
+        lib, drive_root=drive, report=ConversionReport(), with_artwork=with_artwork
     )
     return drive, lib, m_db
 
@@ -154,6 +197,22 @@ def _fields(discrepancies: list) -> set[str]:
 
 def _track_ids(discrepancies: list) -> set[int | None]:
     return {d.track_id for d in discrepancies}
+
+
+def _disc(result, field: str):
+    """Return the first discrepancy with this field name (must exist)."""
+    for d in result.discrepancies:
+        if d.field == field:
+            return d
+    raise AssertionError(
+        f"expected field {field!r} in {_fields(result.discrepancies)}"
+    )
+
+
+def _track_row_id(conn: sqlite3.Connection, title: str) -> int:
+    row = conn.execute("SELECT id FROM Track WHERE title = ?", (title,)).fetchone()
+    assert row is not None, title
+    return int(row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +262,35 @@ def test_sample_limits_tracks_checked(
     assert result.ok is True
     assert result.checked == 2
     assert result.matched == 2
+
+
+def test_sample_zero_checks_no_tracks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """sample=0 is a valid empty smoke: zero tracks checked, playlists still run."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, _m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    result = verify_library(drive, with_artwork=False, sample=0)
+
+    assert result.checked == 0
+    assert result.matched == 0
+    assert result.mismatched == 0
+
+
+def test_sample_negative_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative sample is programmer error, not a silent full-library verify."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, _m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    with pytest.raises(ValueError, match="sample"):
+        verify_library(drive, with_artwork=False, sample=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +366,9 @@ def test_verify_catches_corrupt_quick_cues_blob(
         f.startswith("quick_cue") or f in {"quick_cues", "quickCues"} for f in fields
     ), fields
     assert 20 in _track_ids(result.discrepancies)
+    d = _disc(result, "quick_cues")
+    assert d.expected == "decodable"
+    assert "decode_error" in str(d.actual)
 
 
 def test_verify_catches_deleted_track_row(
@@ -357,10 +448,9 @@ def test_verify_catches_playlist_chain_reorder(
     result = verify_library(drive, with_artwork=False)
 
     assert result.ok is False
-    assert any(
-        "playlist" in d.field or d.field.endswith("order") or d.field == "track_order"
-        for d in result.discrepancies
-    ), _fields(result.discrepancies)
+    d = _disc(result, "playlist[Main Set].track_order")
+    assert d.expected != d.actual
+    assert d.track_id is None
 
 
 def test_render_text_lists_discrepancies(
@@ -383,3 +473,889 @@ def test_render_text_lists_discrepancies(
     assert result.ok is False
     assert "title" in text.lower() or "Alpha" in text or "WRONG" in text
     assert "10" in text or "Alpha" in text
+
+
+def test_render_text_with_many_discrepancies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Many independent mutations must all appear in render_text.
+
+    WHY: Operators fix from the text report; truncating or eliding fields would
+    hide half the damage after a bad convert.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "UPDATE Track SET title = 'T1', artist = 'A1', key = 23 WHERE title = 'Alpha'"
+    )
+    conn.execute(
+        "UPDATE Track SET title = 'T2', artist = 'A2' WHERE title = 'Beta'"
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    text = result.render_text()
+
+    assert result.ok is False
+    assert len(result.discrepancies) >= 4
+    assert "FAILED" in text
+    assert "Discrepancies:" in text
+    # At least one expected/actual pair for a known field name.
+    assert "title" in text
+    assert "expected=" in text and "actual=" in text
+
+
+# ---------------------------------------------------------------------------
+# Beatgrid mutations
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_beatgrid_offset_shift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shifting a beat marker sample_offset must report beatgrid.sample_offsets.
+
+    WHY: A grid shifted by even a few hundred samples makes every downbeat
+    land off the kick — the set feels 'wrong' with no Engine error dialog.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT beatData FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    bd = decode_beat_data(blob)
+    markers = list(bd.default_beat_grid.markers)
+    assert markers, "fixture must write at least one beat marker"
+    # Shift the first marker by a known amount (not derived from verify output).
+    shifted = replace(markers[0], sample_offset=markers[0].sample_offset + 4410.0)
+    new_grid = replace(bd.default_beat_grid, markers=[shifted, *markers[1:]])
+    new_bd = replace(bd, default_beat_grid=new_grid)
+    conn.execute(
+        "UPDATE PerformanceData SET beatData = ? WHERE trackId = ?",
+        (encode_beat_data(new_bd), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.ok is False
+    d = _disc(result, "beatgrid.sample_offsets")
+    assert d.track_id == 10
+    assert d.expected != d.actual
+    # The actual offsets must include the shifted first marker.
+    assert int(shifted.sample_offset) in [int(x) for x in d.actual]
+
+
+def test_verify_catches_beatgrid_marker_count_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dropping a beat marker changes the offset list and must be reported."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Beta")
+    blob = conn.execute(
+        "SELECT beatData FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    bd = decode_beat_data(blob)
+    markers = list(bd.default_beat_grid.markers)
+    assert len(markers) >= 2
+    # Drop the last marker — expected count stays at the source-mapped length.
+    new_grid = replace(bd.default_beat_grid, markers=markers[:-1])
+    conn.execute(
+        "UPDATE PerformanceData SET beatData = ? WHERE trackId = ?",
+        (encode_beat_data(replace(bd, default_beat_grid=new_grid)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    d = _disc(result, "beatgrid.sample_offsets")
+    assert d.track_id == 20
+    assert len(d.expected) == len(markers)
+    assert len(d.actual) == len(markers) - 1
+
+
+def test_verify_catches_corrupt_beat_data_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undecodable beatData is a discrepancy, not a crash or silent skip."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Gamma")
+    conn.execute(
+        "UPDATE PerformanceData SET beatData = ? WHERE trackId = ?",
+        (b"\xff\xfe not-beat-data", tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "beat_data")
+    assert d.expected == "decodable"
+    assert "decode_error" in str(d.actual)
+    assert d.track_id == 30
+
+
+# ---------------------------------------------------------------------------
+# Quick-cue mutations (sample offset, colour, label, pad index)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_quick_cue_sample_offset_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving a cue pad's sample offset must name pad index + expected/actual."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT quickCues FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    qc = decode_quick_cues(blob)
+    cues = list(qc.cues)
+    # Pad 0 holds the HOT cue "Drop" at 44100 in the fixture.
+    assert cues[0].sample_offset == 44100.0
+    new_offset = 99999.0
+    cues[0] = QuickCue(cues[0].label, new_offset, cues[0].color)
+    conn.execute(
+        "UPDATE PerformanceData SET quickCues = ? WHERE trackId = ?",
+        (encode_quick_cues(replace(qc, cues=cues)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "quick_cue[0].sample_offset")
+    assert d.track_id == 10
+    assert d.expected == 44100
+    assert d.actual == int(new_offset)
+
+
+def test_verify_catches_quick_cue_color_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ARGB colour drift on a pad is reported with expected vs actual tuples."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT quickCues FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    qc = decode_quick_cues(blob)
+    cues = list(qc.cues)
+    # Fixture Drop is red ARGB(255,255,0,0); flip to blue.
+    cues[0] = QuickCue(cues[0].label, cues[0].sample_offset, Color(255, 0, 0, 255))
+    conn.execute(
+        "UPDATE PerformanceData SET quickCues = ? WHERE trackId = ?",
+        (encode_quick_cues(replace(qc, cues=cues)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "quick_cue[0].color")
+    assert d.expected == (255, 255, 0, 0)
+    assert d.actual == (255, 0, 0, 255)
+    assert d.track_id == 10
+
+
+def test_verify_catches_quick_cue_label_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pad label text is muscle memory — a silent rename must surface."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT quickCues FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    qc = decode_quick_cues(blob)
+    cues = list(qc.cues)
+    assert cues[0].label == "Drop"
+    cues[0] = QuickCue("RENAMED", cues[0].sample_offset, cues[0].color)
+    conn.execute(
+        "UPDATE PerformanceData SET quickCues = ? WHERE trackId = ?",
+        (encode_quick_cues(replace(qc, cues=cues)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "quick_cue[0].label")
+    assert d.expected == "Drop"
+    assert d.actual == "RENAMED"
+
+
+def test_verify_catches_quick_cue_pad_index_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Moving a cue to a different pad reports the empty source pad's offset.
+
+    WHY: Pad A vs pad C is a different button under the finger. Verify must
+    notice the source pad is empty in m.db, not only that 'some pad' has a cue.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT quickCues FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    qc = decode_quick_cues(blob)
+    cues = list(qc.cues)
+    moved = cues[0]
+    # Clear pad 0 (empty sentinel) and place the cue on pad 3.
+    cues[0] = QuickCue("", -1.0, Color(0, 0, 0, 0))
+    cues[3] = QuickCue(moved.label, moved.sample_offset, moved.color)
+    conn.execute(
+        "UPDATE PerformanceData SET quickCues = ? WHERE trackId = ?",
+        (encode_quick_cues(replace(qc, cues=cues)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    # Source still expects the cue on pad 0.
+    d = _disc(result, "quick_cue[0].sample_offset")
+    assert d.expected == 44100
+    assert d.actual == -1 or d.actual is None
+
+
+# ---------------------------------------------------------------------------
+# Loop mutations
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_loop_start_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loop start sample drift is reported as loop[i].start with both values."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT loops FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    lp = decode_loops(blob)
+    loops = list(lp.loops)
+    # Fixture loop-cue lands in loop slot 0 at start 88200.
+    assert loops[0].start_sample_offset == 88200.0
+    new_start = 1000.0
+    loops[0] = replace(loops[0], start_sample_offset=new_start)
+    conn.execute(
+        "UPDATE PerformanceData SET loops = ? WHERE trackId = ?",
+        (encode_loops(replace(lp, loops=loops)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "loop[0].start")
+    assert d.expected == 88200
+    assert d.actual == int(new_start)
+    assert d.track_id == 10
+
+
+def test_verify_catches_loop_end_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loop end sample drift is reported as loop[i].end with both values."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT loops FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    lp = decode_loops(blob)
+    loops = list(lp.loops)
+    assert loops[0].end_sample_offset == 132300.0
+    new_end = 200000.0
+    loops[0] = replace(loops[0], end_sample_offset=new_end)
+    conn.execute(
+        "UPDATE PerformanceData SET loops = ? WHERE trackId = ?",
+        (encode_loops(replace(lp, loops=loops)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "loop[0].end")
+    assert d.expected == 132300
+    assert d.actual == int(new_end)
+
+
+def test_verify_catches_corrupt_loops_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Undecodable loops blob surfaces as field=loops, not a traceback."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Beta")
+    # loops is uncompressed LE; a short blob fails the count/length checks.
+    conn.execute(
+        "UPDATE PerformanceData SET loops = ? WHERE trackId = ?",
+        (b"\x01\x02", tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "loops")
+    assert d.expected == "decodable"
+    assert "decode_error" in str(d.actual)
+    assert d.track_id == 20
+
+
+# ---------------------------------------------------------------------------
+# Track metadata: title, artist, key, path existence
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_title_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute("UPDATE Track SET title = 'WRONG' WHERE title = 'Alpha'")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "title")
+    assert d.expected == "Alpha"
+    assert d.actual == "WRONG"
+    assert d.track_id == 10
+
+
+def test_verify_catches_artist_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute("UPDATE Track SET artist = 'Other' WHERE title = 'Beta'")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "artist")
+    assert d.expected == "Artist"
+    assert d.actual == "Other"
+    assert d.track_id == 20
+
+
+def test_verify_catches_key_ordinal_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Track.key ordinal must match the mapped source key (Am → 1)."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    # Am maps to ordinal 1; force C major (0) into the column.
+    conn.execute("UPDATE Track SET key = 0 WHERE title = 'Alpha'")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "key")
+    assert d.expected == 1
+    assert d.actual == 0
+    assert d.track_id == 10
+
+
+def test_verify_catches_track_data_key_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """trackData blob key ordinal is checked independently of Track.key."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Alpha")
+    blob = conn.execute(
+        "SELECT trackData FROM PerformanceData WHERE trackId = ?", (tid,)
+    ).fetchone()[0]
+    td = decode_track_data(blob)
+    assert td.key == 1  # Am
+    conn.execute(
+        "UPDATE PerformanceData SET trackData = ? WHERE trackId = ?",
+        (encode_track_data(replace(td, key=12)), tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "track_data.key")
+    assert d.expected == 1
+    assert d.actual == 12
+
+
+def test_verify_catches_corrupt_track_data_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    tid = _track_row_id(conn, "Gamma")
+    conn.execute(
+        "UPDATE PerformanceData SET trackData = ? WHERE trackId = ?",
+        (b"\x00\x00\x00\x04notz", tid),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "track_data")
+    assert d.expected == "decodable"
+    assert "decode_error" in str(d.actual)
+
+
+def test_verify_catches_missing_audio_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Track.path that no longer resolves on disk is path_exists=False.
+
+    WHY: m.db can look perfect while every file on the stick is gone — the
+    classic 'library opens, nothing plays' failure.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, _m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    audio = drive / "Contents" / "a.mp3"
+    assert audio.is_file()
+    audio.unlink()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "path_exists")
+    assert d.expected is True
+    assert d.actual is False
+    assert d.track_id == 10
+
+
+# ---------------------------------------------------------------------------
+# Playlist: drop, rename, count, duplicate-name resolution, chain cycle
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_dropped_playlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source playlist with no matching m.db row is playlist[name].missing."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute("DELETE FROM PlaylistEntity")
+    conn.execute("DELETE FROM Playlist")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    assert "playlist_count" in _fields(result.discrepancies)
+    d = _disc(result, "playlist[Main Set].missing")
+    assert d.expected == "present"
+    assert d.actual == "absent"
+    assert d.track_id is None
+
+
+def test_verify_catches_playlist_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renaming a playlist so neither exact nor 'Name (N)' matches → missing."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "UPDATE Playlist SET title = ? WHERE title = ?",
+        ("Totally Different Name", "Main Set"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    # Count still 1==1, but the named playlist is gone.
+    d = _disc(result, "playlist[Main Set].missing")
+    assert d.expected == "present"
+    assert d.actual == "absent"
+
+
+def test_verify_resolves_duplicate_playlist_title_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Engine renames collisions to 'Name (2)'; verify must still find the list.
+
+    WHY: insert_playlists suffixes duplicates. If verify only did exact title
+    match, every second playlist named 'Main Set' would false-fail as missing.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    # Simulate Engine's duplicate-title suffix without changing entity chain.
+    conn.execute(
+        "UPDATE Playlist SET title = ? WHERE title = ?",
+        ("Main Set (2)", "Main Set"),
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    # Must NOT report playlist[Main Set].missing — suffix scan finds it.
+    assert "playlist[Main Set].missing" not in _fields(result.discrepancies)
+    # Track order still comparable via the resolved list id.
+    assert result.ok is True
+
+
+def test_verify_catches_extra_playlist_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extra Playlist rows (not in source) must bump playlist_count."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, "
+        "lastEditTime, isExplicitlyExported) VALUES ('Orphan', 0, 1, 0, "
+        "'1970-01-01 00:00:00', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    d = _disc(result, "playlist_count")
+    assert d.expected == 1
+    assert d.actual == 2
+
+
+def test_verify_playlist_chain_cycle_does_not_hang(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cyclic nextEntityId chain must terminate and still flag bad order.
+
+    WHY: Without a cycle guard, a corrupted stick could hang verify forever —
+    worse than reporting a discrepancy.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    entities = conn.execute(
+        "SELECT id FROM PlaylistEntity WHERE listId = 1 ORDER BY id"
+    ).fetchall()
+    e1, e2, e3 = entities[0][0], entities[1][0], entities[2][0]
+    # Cycle: e1 → e2 → e1 (e3 orphaned). Tail sentinel never reached cleanly.
+    conn.execute(
+        "UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?", (e2, e1)
+    )
+    conn.execute(
+        "UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?", (e1, e2)
+    )
+    conn.execute(
+        "UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = ?", (e3,)
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    assert result.ok is False
+    assert "playlist[Main Set].track_order" in _fields(result.discrepancies)
+
+
+def test_verify_playlist_skips_unknown_and_unresolved_source_tracks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Expected entity list ignores missing rb_ids and unresolved paths.
+
+    WHY: Source playlists can reference dropped tracks; verify must not invent
+    Engine ids for them, and must not crash — only compare the resolvable
+    prefix against the written chain.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, _m_db = _build_fixture(tmp_path)
+
+    # Replace playlist membership: unknown id, unresolved path, plus real tracks
+    # with a deliberate duplicate (first occurrence wins in expected list).
+    unresolved = replace(lib.tracks[30], resolved_path=None)
+    tracks = dict(lib.tracks)
+    tracks[30] = unresolved
+    playlists = [
+        SourcePlaylist(
+            rb_id=1,
+            parent_rb_id=0,
+            name="Main Set",
+            sort_order=0,
+            is_folder=False,
+            # 999 missing from tracks; 30 has no path; 10 duplicated.
+            track_rb_ids=[10, 10, 999, 30, 20],
+        )
+    ]
+    lib2 = SourceLibrary(
+        drive_root=lib.drive_root, tracks=tracks, playlists=playlists, warnings=[]
+    )
+    _patch_read_library(monkeypatch, lib2)
+
+    result = verify_library(drive, with_artwork=False)
+    # Expected resolvable unique order is [track10, track20]; actual DB still
+    # has [10,20,30] engine ids — order mismatch proves the skip path ran
+    # (if 999/30/dup were not skipped, expected would be a different shape).
+    d = _disc(result, "playlist[Main Set].track_order")
+    assert len(d.expected) == 2  # 10 once, then 20 — 999/30 skipped, dup collapsed
+    assert len(d.actual) == 3
+
+
+# ---------------------------------------------------------------------------
+# Artwork
+# ---------------------------------------------------------------------------
+
+
+def test_verify_catches_deleted_album_art_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting AlbumArt while source still has artwork keys → album_art_count."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path, with_artwork=True)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    assert conn.execute("SELECT COUNT(*) FROM AlbumArt").fetchone()[0] >= 1
+    conn.execute("DELETE FROM AlbumArt")
+    # Clear FKs so the delete is the only intentional damage under test.
+    with contextlib.suppress(sqlite3.OperationalError):
+        conn.execute("UPDATE Track SET albumArtId = NULL")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=True)
+    d = _disc(result, "album_art_count")
+    assert d.expected >= 1
+    assert d.actual == 0
+    assert d.track_id is None
+
+
+def test_verify_artwork_count_matches_unique_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """with_artwork=True on a faithful build: album art count agrees (0 disc)."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, _m_db = _build_fixture(tmp_path, with_artwork=True)
+    _patch_read_library(monkeypatch, lib)
+
+    result = verify_library(drive, with_artwork=True)
+    assert result.ok is True
+    assert "album_art_count" not in _fields(result.discrepancies)
+
+
+def test_verify_catches_extra_album_art_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extra AlbumArt blob (e.g. stale row after re-convert) fails the count.
+
+    Note: verify compares counts of unique content keys, not per-row bytes —
+    byte-level art drift with the same count is out of scope of this check.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path, with_artwork=True)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "INSERT INTO AlbumArt (hash, albumArt) VALUES (?, ?)",
+        ("deadbeef", b"not-real-png-bytes"),
+    )
+    conn.commit()
+    before = conn.execute("SELECT COUNT(*) FROM AlbumArt").fetchone()[0]
+    conn.close()
+
+    result = verify_library(drive, with_artwork=True)
+    d = _disc(result, "album_art_count")
+    assert d.actual == before
+    assert d.expected == before - 1
+
+
+# ---------------------------------------------------------------------------
+# Cannot-verify paths — must raise, never report a false OK
+# ---------------------------------------------------------------------------
+
+
+def test_verify_raises_when_no_engine_library(tmp_path: Path) -> None:
+    """No Engine Library/Database2/m.db → FatalError (CLI exit 2)."""
+    from rb2engine.verify import verify_library
+
+    drive = tmp_path / "empty_stick"
+    drive.mkdir()
+    (drive / "PIONEER").mkdir()
+
+    with pytest.raises(FatalError, match=r"no m.db"):
+        verify_library(drive)
+
+
+def test_verify_raises_on_unreadable_mdb(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Garbage bytes at m.db path must not verify as OK."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+    m_db.write_bytes(b"this is not a sqlite database at all")
+
+    with pytest.raises(FatalError, match=r"unreadable|non-Engine"):
+        verify_library(drive, with_artwork=False)
+
+
+def test_verify_raises_on_unsupported_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unsupported Information schema triple → UnsupportedFormatError, not OK."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "UPDATE Information SET schemaVersionMajor = 99, "
+        "schemaVersionMinor = 0, schemaVersionPatch = 0"
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(UnsupportedFormatError, match="Unsupported Engine schema"):
+        verify_library(drive, with_artwork=False)
+
+
+def test_verify_catches_corrupted_artwork_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swapped or corrupted image BLOBs must be caught, not just row counts.
+
+    WHY: comparing AlbumArt row COUNT alone passes when the bytes are wrong —
+    re-encoded, truncated, or the wrong cover entirely. The count is identical;
+    the DJ sees the wrong artwork. Verify recomputes the dedup key over the
+    stored blob, so any byte drift surfaces as a key the source never produced.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path, with_artwork=True)
+    _patch_read_library(monkeypatch, lib)
+
+    assert verify_library(drive, with_artwork=True).ok
+
+    conn = sqlite3.connect(m_db)
+    try:
+        # Same row count, different bytes — the case a count check cannot see.
+        conn.execute("UPDATE AlbumArt SET albumArt = ?", (b"\x89PNG\r\n\x1a\nDIFFERENT",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = verify_library(drive, with_artwork=True)
+
+    assert not result.ok
+    assert any("content_key" in d.field for d in result.discrepancies), (
+        f"expected an artwork content_key discrepancy, got {_fields(result.discrepancies)}"
+    )
+    # Row count is unchanged, proving the count check alone would have passed.
+    assert not any(d.field == "album_art_count" for d in result.discrepancies)
+
+
+def test_verify_catches_empty_artwork_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An AlbumArt row with no bytes is a writer bug that must not read as OK."""
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path, with_artwork=True)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(m_db)
+    try:
+        conn.execute("UPDATE AlbumArt SET albumArt = ?", (b"",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = verify_library(drive, with_artwork=True)
+
+    assert not result.ok
+    assert any(".bytes" in d.field for d in result.discrepancies)

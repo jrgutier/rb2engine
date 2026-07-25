@@ -16,6 +16,7 @@ from typing import Any
 
 from rb2engine.errors import FatalError
 from rb2engine.ir import SourceLibrary, SourcePlaylist, SourceTrack
+from rb2engine.ir_engine import artwork_content_hash
 from rb2engine.mapper.track import map_track
 from rb2engine.reader.library import read_library
 from rb2engine.writer.blobs import (
@@ -114,9 +115,15 @@ def verify_library(
     if not m_db_path.is_file():
         raise FatalError(f"no m.db to verify at {m_db_path}")
 
-    # Schema probe — confirms the file is an Engine library; unused for DDL
-    # selection because we only read existing rows.
-    _ = detect_schema(m_db_path)
+    # Schema probe — confirms m.db is a readable Engine library with a
+    # supported schema. Reading rows is schema-agnostic, but an unknown or
+    # unreadable schema must not report a false OK (CLI exit 2).
+    schema = detect_schema(m_db_path)
+    if schema is None:
+        raise FatalError(f"unreadable or non-Engine m.db at {m_db_path}")
+    from rb2engine.writer.schema import resolve_schema
+
+    resolve_schema(schema)
 
     source = read_library(drive_root, with_anlz=True, with_artwork=with_artwork)
     engine_lib = drive_root / ENGINE_LIBRARY_DIRNAME
@@ -650,6 +657,37 @@ def _compare_artwork(
                 actual=actual,
             )
         )
+
+    # Row count alone is not verification: swapped, truncated or re-encoded
+    # image bytes keep the count identical while the user sees wrong covers.
+    # Recompute the dedup key over the stored BLOB and compare it to the keys
+    # the source produced — that is the same function the writer used, so any
+    # byte drift shows up as a key that should not exist.
+    if not keys:
+        return
+    for row_id, blob in conn.execute(
+        "SELECT id, albumArt FROM AlbumArt ORDER BY id"
+    ).fetchall():
+        if not blob:
+            discrepancies.append(
+                Discrepancy(
+                    track_id=None,
+                    field=f"album_art[{row_id}].bytes",
+                    expected="non-empty image",
+                    actual="empty blob",
+                )
+            )
+            continue
+        stored_key = artwork_content_hash(bytes(blob))
+        if stored_key not in keys:
+            discrepancies.append(
+                Discrepancy(
+                    track_id=None,
+                    field=f"album_art[{row_id}].content_key",
+                    expected=f"one of {len(keys)} source artwork keys",
+                    actual=stored_key,
+                )
+            )
 
 
 def _resolve_track_path(engine_lib: Path, track_path: str) -> Path:

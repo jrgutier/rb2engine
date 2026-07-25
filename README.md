@@ -56,11 +56,17 @@ uv run rb2engine --help
 ## Usage
 
 ```bash
-# Look at what's on a stick — reads only, writes nothing
+# Check your setup and what's on a stick — always safe to run first
+rb2engine doctor /Volumes/MY_USB
+
+# Look at what rekordbox recorded — reads only, writes nothing
 rb2engine inspect /Volumes/MY_USB
 
 # Convert
 rb2engine convert /Volumes/MY_USB
+
+# Confirm the conversion is faithful, track by track
+rb2engine verify /Volumes/MY_USB
 
 # See what would happen without writing
 rb2engine convert /Volumes/MY_USB --dry-run
@@ -69,9 +75,58 @@ rb2engine convert /Volumes/MY_USB --dry-run
 rb2engine convert /Volumes/MY_USB --no-artwork
 ```
 
-**Exit codes:** `0` clean · `1` converted, but some tracks were skipped · `2` fatal, nothing usable written.
+### Commands
 
-Every run writes `Engine Library/rb2engine-report.json` listing what converted, what was skipped and why, and any dropped cues or loops.
+| Command | Writes? | What it does |
+|---|---|---|
+| `convert` | **yes**, only inside `Engine Library/` | Builds the Engine library from the rekordbox export |
+| `inspect` | no | Dumps what rekordbox recorded — tracks, playlists, cues, grids. `--json` for machine output |
+| `verify` | no | Decodes the library you just wrote and diffs it against the source |
+| `doctor` | no | Versions, supported schemas, and a read of the drive |
+
+**Exit codes** (all commands): `0` all good · `1` finished with something worth
+your attention — tracks skipped on `convert`, discrepancies on `verify` · `2`
+fatal, nothing usable written.
+
+Every `convert` writes `Engine Library/rb2engine-report.json` listing what
+converted, what was skipped and why, and any dropped cues or loops.
+
+### Checking a conversion worked
+
+`verify` is the answer to "did that actually work?". Instead of opening Engine
+and spot-checking a few tracks, it decodes the `m.db` that was written and
+compares it against a fresh parse of the source — **at sample granularity**:
+
+- beatgrid marker positions
+- hot-cue pad number, position, ARGB colour and label
+- loop in/out points
+- track metadata and that each `path` resolves to a real file
+- playlist order, reconstructed from Engine's linked list
+- artwork counts
+
+```bash
+rb2engine verify /Volumes/MY_USB            # whole library
+rb2engine verify /Volumes/MY_USB --sample 50  # first 50 tracks (much faster over USB)
+```
+
+Exit `0` if everything matches, `1` if it finds discrepancies (each one listed
+with track, field, expected and actual), `2` if it could not verify at all.
+
+### When something looks wrong
+
+`doctor` first. It is read-only and tells you what rb2engine sees:
+
+```bash
+rb2engine doctor                      # versions and supported schemas
+rb2engine doctor /Volumes/MY_USB      # + what's actually on the drive
+rb2engine doctor --engine-db path/to/m.db   # is this schema supported?
+```
+
+It reports the tool and dependency versions, which Engine schemas are bundled,
+the drive layout, and — if the drive already has a library — its schema and
+UUID. An unsupported schema is named explicitly along with how to add it,
+rather than failing with a bare error. See
+[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
 ### Options
 
@@ -79,7 +134,7 @@ Every run writes `Engine Library/rb2engine-report.json` listing what converted, 
 |---|---|
 | `--dry-run` | Parse and map, write nothing |
 | `--no-artwork` | Skip cover-art extraction |
-| `--target-schema 3.0.2` | Force an Engine schema version (default: read from the existing database) |
+| `--target-schema 3.0.2` | Force an Engine schema version (see *Which schema gets written* below) |
 | `--database-uuid UUID` | Override the library UUID (default: reuse the existing one) |
 | `--report PATH` | Write the JSON report elsewhere |
 | `-v` / `-vv` | More logging · `--log-json` for machine-readable logs |
@@ -110,8 +165,23 @@ Still: **it's a DJ library. Back it up before you point a new tool at it.**
 
 ## Supported versions
 
-- **Engine DJ**: schema `3.0.1` and `3.0.2` (Engine DJ 4.x). The target version is read from your existing database rather than guessed — the same Engine build can run different schema versions on the desktop and on a stick.
+- **Engine DJ**: schema `3.0.1` and `3.0.2` (Engine DJ 4.x).
 - **rekordbox**: exports from rekordbox 5, 6 and 7.
+
+### Which schema gets written
+
+Never guessed from the app version — the same Engine build was observed running
+`3.0.1` on the desktop library and `3.0.2` on a USB stick. In precedence order:
+
+1. `--target-schema`, if you pass it
+2. **the schema already on the drive** — a `3.0.2` stick stays `3.0.2`
+3. your own Engine desktop library, if one is readable on this machine
+4. `3.0.1` as a conservative fallback
+
+The fallback is the *oldest* supported version on purpose. Engine migrates an
+older schema upward — a `3.0.1` stick was migrated in place to `3.0.2` by
+Engine DJ 4.3.0 — but there is no downgrade path, so writing the newest version
+to a fresh stick could hand an older Engine something it cannot open.
 
 If your stick uses a schema rb2engine doesn't know, it **refuses to write** and tells you, rather than producing a database Engine might silently misread. Adding a version is a schema capture plus one line — see `src/rb2engine/writer/ddl/README.md`.
 
@@ -134,7 +204,7 @@ Positions are integer sample counts throughout; the millisecond conversion happe
 
 ```bash
 uv sync
-uv run pytest          # ~430 tests
+uv run pytest          # ~475 tests
 uv run ruff check src/ tests/
 uv run mypy src/
 ```

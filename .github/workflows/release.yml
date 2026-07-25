@@ -34,7 +34,7 @@ jobs:
       - run: uv run ruff check src/ tests/
       - run: uv run mypy src/
       # real_stick tests need physical hardware and are excluded in CI.
-      - run: uv run pytest -q -m "not real_stick"
+      - run: uv run pytest -q -m "not real_stick" --cov --cov-report=term-missing
 
   build:
     needs: test

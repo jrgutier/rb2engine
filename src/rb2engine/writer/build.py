@@ -43,10 +43,71 @@ M_DB_TMP_NAME = "m.db.tmp"
 _DETERMINISTIC_EPOCH = 0
 _DETERMINISTIC_PLAYED_INDICATOR = 0
 
-# Default when the drive has no prior m.db and the caller did not pin a schema.
-# Engine DJ 4.3.0 desktop / many sticks use 3.0.1; a pre-existing m.db's triple
-# always wins (detect_schema) so a 3.0.2 stick stays 3.0.2.
+# Fallback when we have no evidence at all: no prior m.db on the drive, no
+# readable desktop library, and no explicit --target-schema.
+#
+# 3.0.1 rather than the newest we support, because the two directions are not
+# symmetric: Engine migrates an older schema UPWARD (observed on real hardware —
+# a 3.0.1 stick was migrated in place to 3.0.2 by Engine DJ 4.3.0), but there is
+# no downgrade path. Writing the older version degrades gracefully for someone
+# on an earlier Engine; writing the newest would hand them a database their
+# build may simply refuse to open.
 _DEFAULT_SCHEMA: tuple[int, int, int] = (3, 0, 1)
+
+# Where Engine DJ keeps the desktop library on each platform. Read-only, and
+# only consulted for a FRESH stick — a drive that already has an m.db always
+# keeps its own triple.
+_DESKTOP_LIBRARY_CANDIDATES: tuple[tuple[str, ...], ...] = (
+    ("Music", "Engine Library", "Database2", "m.db"),
+    ("Documents", "Engine Library", "Database2", "m.db"),
+)
+
+
+def detect_desktop_schema() -> tuple[int, int, int] | None:
+    """Best-effort read of the user's own Engine desktop library schema.
+
+    A fresh stick carries no signal about which Engine the user runs, so the
+    next best evidence is the library Engine maintains on this machine. Strictly
+    read-only and never fatal: any failure just means we fall back.
+
+    Returns None when nothing readable is found, or when the version found is
+    one we have no DDL for (writing a supported older schema and letting Engine
+    migrate up beats writing a version we cannot actually produce).
+    """
+    from rb2engine.writer import database as database_mod
+    from rb2engine.writer.schema import SUPPORTED_SCHEMAS
+
+    home = Path.home()
+    roots = [home, Path("/Users/Shared")] if os.name == "posix" else [home]
+    for root in roots:
+        for parts in _DESKTOP_LIBRARY_CANDIDATES:
+            candidate = root.joinpath(*parts)
+            if not candidate.is_file():
+                continue
+            try:
+                triple = database_mod.detect_schema(candidate)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must never fail a run
+                logger.debug("desktop library unreadable at %s: %s", candidate, exc)
+                continue
+            if triple is None:
+                continue
+            if triple in SUPPORTED_SCHEMAS:
+                logger.info(
+                    "no library on the drive; adopting schema %d.%d.%d from the "
+                    "Engine desktop library at %s",
+                    *triple,
+                    candidate,
+                )
+                return triple
+            logger.warning(
+                "Engine desktop library at %s reports unsupported schema "
+                "%d.%d.%d; falling back to %d.%d.%d (Engine migrates upward)",
+                candidate,
+                *triple,
+                *_DEFAULT_SCHEMA,
+            )
+            return None
+    return None
 
 
 def reconcile(engine_lib_root: Path) -> None:
@@ -111,7 +172,14 @@ def build_library(
 
     # Schema + uuid: prefer explicit args, else carry forward from existing m.db.
     prior_schema, prior_uuid = _read_prior_identity(m_db_path if m_db_existed else None)
-    schema = target_schema or prior_schema or _DEFAULT_SCHEMA
+    # Precedence: explicit flag > the drive's own existing library > the user's
+    # desktop Engine library > conservative fallback.
+    schema = (
+        target_schema
+        or prior_schema
+        or (detect_desktop_schema() if not m_db_existed else None)
+        or _DEFAULT_SCHEMA
+    )
     db_uuid = database_uuid or prior_uuid  # None → create_m_db mints
 
     # Late imports keep this module importable while sibling writer modules

@@ -38,4 +38,4 @@ jobs:
 
       - name: Pytest
         # real_stick tests need physical hardware; excluded in CI.
-        run: uv run pytest -q -m "not real_stick"
+        run: uv run pytest -q -m "not real_stick" --cov --cov-report=term-missing

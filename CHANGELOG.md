@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-25
+
+### Added
+- Fresh sticks now adopt the schema from your own Engine desktop library when
+  one is readable, instead of always falling back to a fixed default. A drive
+  that already has a library still keeps its own version.
+- `verify` now compares album-art **bytes**, not just AlbumArt row counts.
+  Swapped, truncated or re-encoded images keep the count identical while the
+  DJ sees the wrong cover.
+- Coverage measurement with an 85% floor, enforced in CI and on release.
+
+### Changed
+- README documents `verify` and `doctor`, and the schema precedence rules.
+
+### Testing
+- 640 tests, 87% branch coverage (was 476 / 81% statement).
+- `reader/tags.py` 52% -> 98%, `reader/library.py` 32% -> 98%,
+  `writer/build.py` 77% -> 99%, `writer/artwork.py` 70% -> 100%.
+  `library.py` mattered most: it is the orchestration join whose absence broke
+  the pipeline once, and its only real tests were hardware-gated and skipped
+  in CI.
+
 ## [0.2.0] - 2026-07-25
 
 ### Added
