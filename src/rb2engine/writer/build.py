@@ -17,6 +17,7 @@ Safety boundary — this is the ONLY module that writes to the user's stick:
 from __future__ import annotations
 
 import logging
+import contextlib
 import os
 import shutil
 import sqlite3
@@ -343,27 +344,50 @@ def _finalize(conn: sqlite3.Connection) -> None:
 
 
 def _fsync_file(path: Path) -> None:
-    """Flush file contents to stable storage before rename."""
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    """Flush file contents to stable storage before the rename.
 
-
-def _fsync_dir(path: Path) -> None:
-    """fsync the directory so the rename is durable (best-effort on all OSes)."""
+    Best-effort by design. fsync semantics vary across platforms and
+    filesystems — Windows in particular can reject an fsync on a handle
+    opened this way with EBADF. Durability is a nice-to-have here; the
+    correctness guarantee comes from os.replace() being atomic against
+    process failure. Never let a failed fsync abort a completed conversion.
+    """
     try:
         fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
+    except OSError as exc:
+        logger.debug("fsync skipped for %s: %s", path, exc)
         return
     try:
         os.fsync(fd)
-    except OSError:
-        # Some platforms (notably Windows) reject directory fsync.
-        pass
+    except OSError as exc:
+        logger.debug("fsync unsupported for %s: %s", path, exc)
     finally:
-        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync the directory so the rename is durable (POSIX only, best-effort).
+
+    Directory fsync is a POSIX concept and is not meaningful on Windows, where
+    os.replace() is backed by MoveFileEx and is atomic without it. Skipping
+    entirely on Windows avoids an EBADF that would otherwise fail a conversion
+    that had already succeeded.
+    """
+    if os.name != "posix":
+        return
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError as exc:
+        logger.debug("dir fsync skipped for %s: %s", path, exc)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        logger.debug("dir fsync unsupported for %s: %s", path, exc)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def _rmtree(path: Path) -> None:

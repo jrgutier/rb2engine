@@ -20,7 +20,8 @@ Why these cases exist:
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
+import re
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -109,7 +110,10 @@ def test_absolute_base_is_diagnostic_only(tmp_path: Path) -> None:
         base="absolute",
     )
     assert got == music_abs.resolve().as_posix()
-    assert got.startswith("/")
+    # Absolute means "rooted", which looks different per platform: "/..." on
+    # POSIX, "C:/..." on Windows. Assert it is genuinely absolute rather than
+    # assuming a leading slash.
+    assert PurePosixPath(got).is_absolute() or re.match(r"^[A-Za-z]:/", got)
     assert "Contents/A/b.mp3" in got
 
 
