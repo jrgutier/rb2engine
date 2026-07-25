@@ -111,14 +111,26 @@ def test_resolve_schema_supported_triple() -> None:
     assert path.parent == schema_mod.DDL_DIR
 
 
+def test_resolve_schema_supports_3_0_2() -> None:
+    """3.0.2 is now supported — captured from the user's own stick.
+
+    Engine DJ 4.3.0 migrated that stick's database 3.0.1 -> 3.0.2 in place
+    while the desktop library stayed 3.0.1, so the SAME app build runs both.
+    Supporting a new version was a DDL capture plus one dict entry, exactly as
+    the version-keyed design intended — no code change.
+    """
+    path = schema_mod.resolve_schema((3, 0, 2))
+    assert path.is_file()
+    assert path.name == schema_mod.SUPPORTED_SCHEMAS[(3, 0, 2)]
+
+
 def test_resolve_schema_unsupported_raises() -> None:
     """G3: unknown schema must fail loud (exit 2 path), never write a guess.
 
-    3.0.2 is a real Engine schema we deliberately do not support yet; 9.9.9
-    is nonsense. Both must raise UnsupportedFormatError with supported
-    versions and a pointer at the capture runbook.
+    Both are versions we have no captured DDL for. Writing a guessed schema
+    would produce a database Engine may silently misread.
     """
-    for triple in ((3, 0, 2), (9, 9, 9)):
+    for triple in ((3, 0, 0), (9, 9, 9)):
         with pytest.raises(UnsupportedFormatError) as exc_info:
             schema_mod.resolve_schema(triple)
         msg = str(exc_info.value)

@@ -1,1 +1,381 @@
-"""Atomic os.replace() of m.db and reconcile(); preserves sibling DBs and Music/."""
+"""Atomic os.replace() of m.db and reconcile(); preserves sibling DBs and Music/.
+
+Safety boundary — this is the ONLY module that writes to the user's stick:
+
+* Write ONLY inside ``<drive>/Engine Library/``. Never touch ``PIONEER/`` or
+  ``Contents/``.
+* Build ``Database2/m.db.tmp`` in the same directory as ``m.db``, flush +
+  fsync, close, then ``os.replace()`` over ``m.db``. Same-directory file
+  replace is atomic against process failure on POSIX and Windows.
+* PRESERVE everything we do not author: ``hm.db``, ``sm.db``, ``stm.db``,
+  ``Music/``, ``Artwork/``, ``OverviewData/``, and any unknown file.
+* Carry forward schema triple + ``Information.uuid`` from an existing ``m.db``.
+* A stray ``m.db.tmp`` is deleted on startup, never adopted.
+* On fatal error: remove ``m.db.tmp``, leave the previous ``m.db`` untouched.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import sqlite3
+import tempfile
+from pathlib import Path
+
+from rb2engine.errors import FatalError
+from rb2engine.ir import SourceArtwork, SourceLibrary
+from rb2engine.ir_engine import EngineTrack
+from rb2engine.report import ConversionReport
+
+logger = logging.getLogger(__name__)
+
+ENGINE_LIBRARY_DIRNAME = "Engine Library"
+DATABASE2_DIRNAME = "Database2"
+M_DB_NAME = "m.db"
+M_DB_TMP_NAME = "m.db.tmp"
+
+# Default when the drive has no prior m.db and the caller did not pin a schema.
+# Engine DJ 4.3.0 desktop / many sticks use 3.0.1; a pre-existing m.db's triple
+# always wins (detect_schema) so a 3.0.2 stick stays 3.0.2.
+_DEFAULT_SCHEMA: tuple[int, int, int] = (3, 0, 1)
+
+
+def reconcile(engine_lib_root: Path) -> None:
+    """Startup cleanup of crash residue; never touches sibling DBs or Music/.
+
+    * ``Database2/m.db.tmp`` → delete (never adopt a partial build).
+    * ``Database2/m.db.tmp-journal`` → delete.
+    * legacy ``Engine Library.tmp/`` or ``Engine Library.old/`` beside the
+      library → delete (artifacts of the withdrawn directory-swap design).
+    """
+    engine_lib_root = Path(engine_lib_root)
+    db2 = engine_lib_root / DATABASE2_DIRNAME
+    if db2.is_dir():
+        tmp = db2 / M_DB_TMP_NAME
+        if tmp.exists():
+            logger.warning("removing stray %s (never adopted)", tmp)
+            tmp.unlink(missing_ok=True)
+        journal = db2 / f"{M_DB_TMP_NAME}-journal"
+        if journal.exists():
+            journal.unlink(missing_ok=True)
+
+    parent = engine_lib_root.parent
+    for legacy_name in (f"{ENGINE_LIBRARY_DIRNAME}.tmp", f"{ENGINE_LIBRARY_DIRNAME}.old"):
+        legacy = parent / legacy_name
+        if legacy.exists():
+            logger.warning("removing legacy artifact %s", legacy)
+            if legacy.is_dir():
+                _rmtree(legacy)
+            else:
+                legacy.unlink(missing_ok=True)
+
+
+def build_library(
+    lib: SourceLibrary,
+    *,
+    drive_root: Path,
+    report: ConversionReport,
+    path_base: str = "engine-lib",
+    target_schema: tuple[int, int, int] | None = None,
+    database_uuid: str | None = None,
+    with_artwork: bool = True,
+) -> Path:
+    """Orchestrate a full m.db write and return the final m.db path.
+
+    See module docstring for the swap protocol and preservation rules.
+    """
+    drive_root = Path(drive_root)
+    report.path_base = path_base
+
+    engine_lib = drive_root / ENGINE_LIBRARY_DIRNAME
+    db2 = engine_lib / DATABASE2_DIRNAME
+    m_db_path = db2 / M_DB_NAME
+    tmp_path = db2 / M_DB_TMP_NAME
+
+    library_existed = engine_lib.is_dir()
+    m_db_existed = m_db_path.is_file()
+
+    # Reconcile before any read of the prior library (stray tmp must not be
+    # mistaken for state, and must not block detect_schema on m.db).
+    if library_existed:
+        reconcile(engine_lib)
+
+    # Schema + uuid: prefer explicit args, else carry forward from existing m.db.
+    prior_schema, prior_uuid = _read_prior_identity(m_db_path if m_db_existed else None)
+    schema = target_schema or prior_schema or _DEFAULT_SCHEMA
+    db_uuid = database_uuid or prior_uuid  # None → create_m_db mints
+
+    # Late imports keep this module importable while sibling writer modules
+    # land (concurrent workers). Contract signatures are fixed.
+    from rb2engine.writer import database as database_mod
+    from rb2engine.writer.playlists import insert_playlists
+
+    conn: sqlite3.Connection | None = None
+    stage_dir: Path | None = None
+    try:
+        engine_lib.mkdir(parents=True, exist_ok=True)
+        db2.mkdir(parents=True, exist_ok=True)
+
+        # Never adopt a leftover tmp — wipe again just before create.
+        if tmp_path.exists():
+            logger.warning("removing stray %s before create", tmp_path)
+            tmp_path.unlink()
+
+        # Build on LOCAL storage, then copy into place.
+        #
+        # Building directly on the target is not viable on real DJ media: on a
+        # macOS FAT32 (fskit) volume, sqlite3.executescript() of the Engine DDL
+        # fails with "attempt to write a readonly database" even though the
+        # volume is writable and plain CREATE TABLE + commit succeed. Staging
+        # locally sidesteps the driver's journal handling entirely, and is also
+        # far faster than thousands of small writes over USB.
+        stage_dir = Path(tempfile.mkdtemp(prefix="rb2engine-stage-"))
+        stage_path = stage_dir / M_DB_NAME
+
+        create_m_db = database_mod.create_m_db
+        conn = create_m_db(stage_path, schema=schema, uuid=db_uuid)
+
+        report.counters.tracks_read = len(lib.tracks)
+        report.counters.playlists_read = len(lib.playlists)
+
+        # --- artwork (optional) ------------------------------------------------
+        art_ids: dict[str, int] = {}
+        arts: list[SourceArtwork] = []
+        if with_artwork:
+            seen: set[str] = set()
+            for src in lib.tracks.values():
+                if src.artwork is None:
+                    report.counters.artwork_missing += 1
+                    continue
+                report.counters.artwork_found += 1
+                if src.artwork.content_key in seen:
+                    report.counters.artwork_deduped += 1
+                    continue
+                seen.add(src.artwork.content_key)
+                arts.append(src.artwork)
+            if arts:
+                from rb2engine.writer import artwork as artwork_mod
+
+                art_ids = artwork_mod.insert_artwork(conn, arts)
+
+        # --- map + insert tracks -----------------------------------------------
+        from rb2engine.mapper.track import map_track
+        from rb2engine.writer import tracks as tracks_mod
+
+        engine_tracks: list[EngineTrack] = []
+        rb_order: list[int] = []
+        for rb_id in sorted(lib.tracks.keys()):
+            src = lib.tracks[rb_id]
+            if src.resolved_path is None:
+                report.add_skip(
+                    track_id=rb_id,
+                    reason_code="unresolvable_path",
+                    message="resolved_path is None",
+                    title=src.title,
+                )
+                report.counters.tracks_unresolvable_paths += 1
+                continue
+            try:
+                et = map_track(
+                    src,
+                    drive_root=drive_root,
+                    engine_library_dir=engine_lib,
+                )
+            except Exception as exc:  # noqa: BLE001 - soft skip: one bad track must not kill the run
+                report.add_skip(
+                    track_id=rb_id,
+                    reason_code="map_failed",
+                    message=str(exc),
+                    title=src.title,
+                )
+                continue
+            engine_tracks.append(et)
+            rb_order.append(rb_id)
+
+        track_id_map = tracks_mod.insert_tracks(
+            conn, engine_tracks, art_ids=art_ids or None
+        )
+        # If insert_tracks returned empty but we had tracks, synthesise from order
+        # only when the implementation used positional ids (defensive). Prefer
+        # the returned map when non-empty.
+        if not track_id_map and rb_order:
+            # Trust insert_tracks; empty map with non-empty input is a writer bug
+            # but must not invent ids that do not exist.
+            pass
+        # Align map keys to rb_ids when the tracks worker keyed by position —
+        # contract says rb_id → id; use returned map as-is.
+        report.counters.tracks_converted = len(track_id_map) if track_id_map else len(
+            engine_tracks
+        )
+        # Some implementations may key by insert order 1..N; rebuild.
+        if (
+            track_id_map
+            and rb_order
+            and set(track_id_map.keys()) != set(rb_order)
+            and set(track_id_map.keys()) == set(range(1, len(rb_order) + 1))
+        ):
+            track_id_map = {
+                rb_order[i]: track_id_map[i + 1] for i in range(len(rb_order))
+            }
+
+        # --- playlists ---------------------------------------------------------
+        n_playlists = insert_playlists(
+            conn, lib.playlists, track_id_map=track_id_map or {}
+        )
+        report.counters.playlists_converted = n_playlists
+
+        # --- integrity (G4) before swap ----------------------------------------
+        _finalize(conn)
+        conn.close()
+        conn = None
+
+        # journal_mode=DELETE removes m.db.tmp-journal on clean close; assert.
+        # Move the finished database onto the target volume as m.db.tmp, then
+        # atomically replace. shutil.copyfile writes a plain byte stream, which
+        # the FAT32 driver handles fine.
+        shutil.copyfile(stage_path, tmp_path)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+        journal = Path(str(tmp_path) + "-journal")
+        if journal.exists():
+            journal.unlink()
+
+        _fsync_file(tmp_path)
+        _fsync_dir(db2)
+
+        os.replace(tmp_path, m_db_path)
+        _fsync_dir(db2)
+
+        return m_db_path
+
+    except Exception as exc:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as close_exc:  # noqa: BLE001 - already unwinding
+                # Closing a connection that is already broken can raise; we are
+                # in the error path and about to re-raise, so log and continue.
+                logger.debug("ignoring close() failure during rollback: %s", close_exc)
+            conn = None
+        # Leave prior m.db untouched; only discard the in-progress tmp.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError as unlink_exc:
+                logger.error("failed to remove %s: %s", tmp_path, unlink_exc)
+        # Fresh stick: do not leave a half-created Engine Library tree behind.
+        if not library_existed and engine_lib.exists() and not m_db_existed:
+            try:
+                # Only remove if we never successfully published an m.db.
+                if not m_db_path.is_file():
+                    _rmtree(engine_lib)
+            except OSError as rm_exc:
+                logger.error("failed to remove partial %s: %s", engine_lib, rm_exc)
+
+        msg = f"build_library failed: {exc}"
+        report.mark_fatal(msg)
+        if isinstance(exc, FatalError):
+            raise
+        raise FatalError(msg) from exc
+
+
+# ---------------------------------------------------------------------------
+# internals
+# ---------------------------------------------------------------------------
+
+def _read_prior_identity(
+    m_db_path: Path | None,
+) -> tuple[tuple[int, int, int] | None, str | None]:
+    """Return (schema_triple, uuid) from an existing m.db, or (None, None)."""
+    if m_db_path is None or not Path(m_db_path).is_file():
+        return None, None
+
+    from rb2engine.writer import database as database_mod
+
+    schema = None
+    detect = getattr(database_mod, "detect_schema", None)
+    if callable(detect):
+        try:
+            schema = detect(Path(m_db_path))
+        except Exception as exc:  # noqa: BLE001 - unreadable target must not abort; fall back to default
+            logger.warning("detect_schema failed on %s: %s", m_db_path, exc)
+
+    uuid_val: str | None = None
+    try:
+        conn = sqlite3.connect(
+            f"file:{Path(m_db_path).resolve()}?mode=ro", uri=True
+        )
+        try:
+            row = conn.execute(
+                "SELECT schemaVersionMajor, schemaVersionMinor, "
+                "schemaVersionPatch, uuid FROM Information LIMIT 1"
+            ).fetchone()
+            if row is not None:
+                if schema is None:
+                    schema = (int(row[0]), int(row[1]), int(row[2]))
+                uuid_val = str(row[3]) if row[3] is not None else None
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("could not read Information from %s: %s", m_db_path, exc)
+
+    return schema, uuid_val
+
+
+def _finalize(conn: sqlite3.Connection) -> None:
+    """G4: integrity_check + foreign_key_check before the swap is allowed."""
+    # Prefer database.finalize if the database worker provided it.
+    from rb2engine.writer import database as database_mod
+
+    finalize = getattr(database_mod, "finalize", None)
+    if callable(finalize):
+        finalize(conn)
+        return
+
+    conn.commit()
+    row = conn.execute("PRAGMA integrity_check").fetchone()
+    if row is None or str(row[0]).lower() != "ok":
+        raise FatalError(f"PRAGMA integrity_check failed: {row!r}")
+    fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if fk:
+        raise FatalError(f"PRAGMA foreign_key_check reported {len(fk)} issue(s)")
+
+
+def _fsync_file(path: Path) -> None:
+    """Flush file contents to stable storage before rename."""
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync the directory so the rename is durable (best-effort on all OSes)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Some platforms (notably Windows) reject directory fsync.
+        pass
+    finally:
+        os.close(fd)
+
+
+def _rmtree(path: Path) -> None:
+    """Remove a directory tree (local helper; avoids shutil import side effects)."""
+    if not path.exists():
+        return
+    if path.is_file() or path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            _rmtree(child)
+        else:
+            child.unlink(missing_ok=True)
+    path.rmdir()

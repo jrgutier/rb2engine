@@ -12,9 +12,12 @@ from rb2engine.errors import UnsupportedFormatError
 DDL_DIR = Path(__file__).resolve().parent / "ddl"
 
 # Map Engine Information schema triple → DDL filename under DDL_DIR.
-# Seeded with 3.0.1 from Engine DJ 4.3.0; add new dumps via ddl/README.md.
+# Both triples are produced by Engine DJ 4.3.0 (desktop = 3.0.1, stick = 3.0.2
+# after in-place migration). App version does not select the schema — detect
+# from the target m.db. Add new dumps via ddl/README.md.
 SUPPORTED_SCHEMAS: dict[tuple[int, int, int], str] = {
     (3, 0, 1): "schema_3_0_1.sql",
+    (3, 0, 2): "schema_3_0_2.sql",
 }
 
 # Opaque Information.currentPlayedIndiciator (sic). Engine accepts any signed
