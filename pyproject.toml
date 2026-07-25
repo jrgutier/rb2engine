@@ -30,6 +30,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
+markers = [
+    "real_stick: requires the real rekordbox USB stick mounted (Tier B; skipped in CI)",
+]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
@@ -42,3 +45,9 @@ python_version = "3.11"
 mypy_path = "src"
 packages = ["rb2engine"]
 strict = false
+
+# construct, pyrekordbox and mutagen ship no type stubs / py.typed marker.
+# Their absence is a fact about upstream, not a defect here.
+[[tool.mypy.overrides]]
+module = ["construct.*", "pyrekordbox.*", "mutagen.*"]
+ignore_missing_imports = true
