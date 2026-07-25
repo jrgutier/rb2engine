@@ -1,0 +1,20 @@
+[
+  {
+    "offset": 8,
+    "text": "/PIONEER/USBANLZ/P02B/00003DA7/ANLZ0000.DAT",
+    "consumed": 44,
+    "kind": "short_ascii"
+  },
+  {
+    "offset": 121,
+    "text": "/Contents/Cour T_/All Stars 07/Labirinto Babylonia.m4a",
+    "consumed": 55,
+    "kind": "short_ascii"
+  },
+  {
+    "offset": 296,
+    "text": "/PIONEER/USBANLZ/P021/0002E521/ANLZ0000.DAT",
+    "consumed": 44,
+    "kind": "short_ascii"
+  }
+]
