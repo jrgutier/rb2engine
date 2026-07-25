@@ -25,7 +25,10 @@ def artwork_content_hash(image_bytes: bytes) -> str:
     Matches the shape Engine stores (observed 39-char values = 40-char sha1
     with a leading zero removed). Used as the internal AlbumArt dedup key.
     """
-    digest = hashlib.sha1(image_bytes).hexdigest()
+    # sha1 is NOT used here as a security primitive — it is an internal
+    # content-dedup key chosen to match the shape Engine itself stores
+    # (observed 39-char values = a 40-char sha1 with a leading zero stripped).
+    digest = hashlib.sha1(image_bytes).hexdigest()  # noqa: S324
     return digest.lstrip("0") or "0"
 
 

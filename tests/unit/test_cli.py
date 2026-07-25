@@ -162,7 +162,6 @@ def test_subcommand_help(runner: CliRunner, cmd: str) -> None:
 @pytest.mark.parametrize(
     "args",
     [
-        ["convert", "DRIVE"],
         ["verify", "DRIVE"],
         ["doctor"],  # doctor takes --engine-db, not a positional drive
     ],
@@ -179,6 +178,16 @@ def test_unimplemented_exits_two_not_zero(
     assert result.exit_code != 0
     combined = (result.output + (result.stderr or "")).lower()
     assert "not implemented" in combined or "not yet" in combined
+
+
+def test_convert_on_non_stick_exits_two(runner: CliRunner, tmp_path: Path) -> None:
+    """convert IS implemented now; a directory that is not a rekordbox export
+    must still fail loudly with exit 2 rather than writing a partial library."""
+    drive = tmp_path / "not-a-stick"
+    drive.mkdir()
+    result = runner.invoke(main, ["convert", str(drive)])
+    assert result.exit_code == 2
+    assert not (drive / "Engine Library").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +362,8 @@ def test_log_json_does_not_pollute_inspect_stdout(
     # Log lines on stderr: each a JSON object with stage/event
     stderr = result.stderr or ""
     assert stderr.strip(), "expected at least one JSON log line on stderr at -v"
-    for line in stderr.splitlines():
-        line = line.strip()
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
         if not line:
             continue
         obj = json.loads(line)

@@ -51,3 +51,4 @@ tests/fixtures/real/
 # Local reports / scratch
 rb2engine-report.json
 *.tmp
+dist/

@@ -195,10 +195,7 @@ def _with_number_of_beats(
         return []
     out: list[EngineBeatMarker] = []
     for i, m in enumerate(markers):
-        if i + 1 < len(markers):
-            nbeats = int(markers[i + 1].beat_number - m.beat_number)
-        else:
-            nbeats = 0
+        nbeats = int(markers[i + 1].beat_number - m.beat_number) if i + 1 < len(markers) else 0
         out.append(
             EngineBeatMarker(
                 sample_offset=m.sample_offset,

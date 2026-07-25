@@ -301,9 +301,6 @@ def insert_tracks(
         _update_performance_data(conn, track_id, track)
 
         rb_id = getattr(track, "rb_id", None)
-        if rb_id is None:
-            rb_id = track_id
-        else:
-            rb_id = int(rb_id)
+        rb_id = track_id if rb_id is None else int(rb_id)
         id_map[rb_id] = track_id
     return id_map

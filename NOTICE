@@ -1,38 +1,66 @@
 rb2engine
 Copyright (c) 2026 jrgutier
 
-This product includes and references third-party work as follows.
+Licensed under the MIT License. See LICENSE.
+
+rb2engine contains no third-party source code. Every runtime dependency is
+permissively licensed and installed from PyPI, not vendored:
+
+  construct     MIT           binary parsing of export.pdb
+  pyrekordbox   MIT           ANLZ tag structures
+  click         BSD-3-Clause  command-line interface
+  rich          MIT           human-readable output
+
+mutagen (GPL-2.0-or-later) is a DEVELOPMENT dependency only. It is used
+exclusively in the test suite as an independent oracle confirming that
+`src/rb2engine/reader/tags.py` extracts byte-identical cover art. It is not
+imported by any module under `src/` and is not required at runtime, so no
+copyleft obligation attaches to rb2engine or its distribution.
+
+The projects below informed this work but are NOT included, copied, linked
+against, or redistributed here. They are credited because interoperability
+work is only possible thanks to the people who documented these formats.
 
 ---------------------------------------------------------------------------
-crate-digger (EPL-2.0)
+crate-digger — Deep Symmetry, LLC and contributors (EPL-2.0)
 ---------------------------------------------------------------------------
 
-rb2engine vendors a Python parser generated from the Kaitai Struct
-definition `rekordbox_pdb.ksy` originally published by the crate-digger
-project (Deep Symmetry, LLC and contributors).
+  https://github.com/Deep-Symmetry/crate-digger
 
-  Project: https://github.com/Deep-Symmetry/crate-digger
-  License: Eclipse Public License 2.0 (EPL-2.0)
+crate-digger's Kaitai Struct definition `rekordbox_pdb.ksy` is the reference
+reverse-engineering of the rekordbox `export.pdb` DeviceSQL format. It was
+read as documentation while writing `src/rb2engine/reader/pdb.py`.
 
-The generated module lives under `src/rb2engine/reader/_vendor/` together
-with a copy of the EPL-2.0 license text. That file is subject to EPL-2.0
-only; EPL-2.0 is file-scoped and does not relicense the rest of rb2engine
-(MIT). When regenerating the parser:
-
-  kaitai-struct-compiler -t python rekordbox_pdb.ksy
-
-Do not copy other crate-digger source into this tree.
+No crate-digger source is included, and no code is generated from its
+`.ksy`. The parser here is an independent implementation written against the
+MIT-licensed `construct` library. Facts about a binary layout — field order,
+offsets, endianness — are not copyrightable expression, and none of
+crate-digger's code or text is reproduced.
 
 ---------------------------------------------------------------------------
-libdjinterop (LGPL-3.0) — documentation only
+libdjinterop — xsco and contributors (LGPL-3.0)
 ---------------------------------------------------------------------------
 
-libdjinterop (https://github.com/xsco/libdjinterop) is used solely as a
-reference for the Engine DJ SQLite schema and PerformanceData blob layouts.
+  https://github.com/xsco/libdjinterop
 
-  License: GNU Lesser General Public License v3.0 (LGPL-3.0)
+libdjinterop is the reference for the Engine DJ SQLite schema and the
+PerformanceData blob encodings. It was read as documentation only.
 
-No libdjinterop source code, headers, object code, or linked binary is
-included in, generated into, or linked against rb2engine. Schema DDL
-committed under `src/rb2engine/writer/ddl/` is captured from Engine DJ's
-own output, not copied from libdjinterop.
+No libdjinterop source code, header, object code, or linked binary is
+included in, generated into, or linked against rb2engine. Critically, the
+schema DDL committed under `src/rb2engine/writer/ddl/` was NOT transcribed
+from libdjinterop: it is captured with `sqlite3` from databases that Engine
+DJ itself authored, so the schema text originates from Engine's own output.
+
+---------------------------------------------------------------------------
+Engine DJ and rekordbox
+---------------------------------------------------------------------------
+
+Engine DJ is a product of inMusic Brands, Inc. rekordbox is a product of
+AlphaTheta Corporation (formerly Pioneer DJ). rb2engine is an independent,
+unaffiliated interoperability tool. No endorsement is implied, and no
+trademarks are claimed.
+
+The captured schema files describe a data format for the sole purpose of
+interoperability between software the user already owns, operating on the
+user's own library, on the user's own hardware.

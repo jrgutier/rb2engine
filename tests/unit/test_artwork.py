@@ -213,7 +213,10 @@ def test_extract_corrupt_image_data_warns_and_returns_none(tmp_path: Path) -> No
         art = extract_artwork(track)
 
     assert art is None
-    assert any("corrupt" in str(w.message).lower() or "undecodable" in str(w.message).lower() for w in caught)
+    assert any(
+        "corrupt" in str(w.message).lower() or "undecodable" in str(w.message).lower()
+        for w in caught
+    )
 
 
 def test_extract_non_ascii_path(tmp_path: Path) -> None:

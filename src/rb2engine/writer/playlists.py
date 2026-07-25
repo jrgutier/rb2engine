@@ -111,7 +111,7 @@ def insert_playlists(
     for rb_id, pl in by_rb.items():
         parent_engine = 0 if pl.parent_rb_id == 0 else engine_id_of[pl.parent_rb_id]
         siblings[parent_engine].append(rb_id)
-    for parent_engine, group in siblings.items():
+    for group in siblings.values():
         group.sort(key=lambda r: (by_rb[r].sort_order, r))
 
     # nextListId: each sibling points at the next sibling's engine id; tail → 0.

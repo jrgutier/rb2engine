@@ -204,7 +204,7 @@ def test_lowercase_pioneer_and_contents_resolve_to_on_disk_casing(
     assert "pioneer" in layout.export_pdb.parts
     assert "PIONEER" not in layout.export_pdb.parts
     assert layout.usbanlz_dir.exists()
-    assert layout.usbanlz_dir.name == "USBANLZ" or layout.usbanlz_dir.name == "usbanlz"
+    assert layout.usbanlz_dir.name in {"USBANLZ", "usbanlz"}
     assert layout.contents_dir is not None
     assert layout.contents_dir.name == "contents"
     assert "Contents" not in layout.contents_dir.parts

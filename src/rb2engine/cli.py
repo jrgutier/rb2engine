@@ -1,7 +1,7 @@
 """click app: convert | inspect | verify | doctor; exit codes 0/1/2.
 
-Only ``inspect`` is implemented in this pass. Other commands exit 2 with an
-honest "not implemented yet" message rather than pretending success.
+``convert`` and ``inspect`` are implemented. ``verify`` and ``doctor`` exit 2
+with an honest "not implemented yet" message rather than pretending success.
 
 ``inspect`` is strictly read-only: it never writes under the drive, and exits
 0 even when the source library carries warnings/skips (inspection ≠ conversion).
@@ -12,13 +12,16 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from rb2engine import __version__
 from rb2engine.errors import FatalError, UnsupportedFormatError
 from rb2engine.logging import configure_logging, log_event
+
+if TYPE_CHECKING:  # import only for typing — keeps CLI startup light
+    from rb2engine.report import ConversionReport
 
 
 def load_source_library(drive: Path) -> Any:
@@ -172,19 +175,47 @@ def _not_implemented(ctx: click.Context, name: str) -> None:
     ctx.exit(2)
 
 
+def _emit_report(
+    report: ConversionReport,
+    drive: Path | None,
+    override: Path | None,
+) -> None:
+    """Print the human report and write the machine JSON beside the library.
+
+    Never fatal: a conversion that succeeded must not be reported as failed
+    just because the report file could not be written (e.g. a full or
+    read-only drive). The human summary still reaches stdout.
+    """
+    from rb2engine.report import resolve_report_path
+
+    report.print_human()
+    try:
+        target = resolve_report_path(
+            drive, override=override, library_ready=not report.fatal
+        )
+        written = report.write_json(target)
+        click.echo(f"report: {written}")
+    except OSError as exc:
+        click.echo(f"warning: could not write JSON report: {exc}", err=True)
+
+
 @main.command("convert")
 @click.argument(
     "drive",
     type=click.Path(exists=False, path_type=Path),
     required=False,
 )
-@click.option("--dry-run", is_flag=True, help="Parse and map without writing (future).")
-@click.option("--database-uuid", default=None, help="Override Information.uuid (future).")
+@click.option("--dry-run", is_flag=True, help="Parse and map without writing anything.")
+@click.option(
+    "--database-uuid",
+    default=None,
+    help="Override Information.uuid (default: reuse the existing one).",
+)
 @click.option(
     "--path-base",
     type=click.Choice(["engine-lib", "drive-root", "absolute"], case_sensitive=False),
     default=None,
-    help="Track.path base strategy (future; absolute is diagnostic-only).",
+    help="Track.path base (default engine-lib; absolute is diagnostic-only).",
 )
 @click.option("--target-schema", default=None, help="Engine schema triple, e.g. 3.0.1.")
 @click.option(
@@ -206,9 +237,78 @@ def convert_cmd(
     report_path: Path | None,
     no_artwork: bool,
 ) -> None:
-    """Convert a rekordbox USB export into an Engine Library (not yet implemented)."""
-    _ = (drive, dry_run, database_uuid, path_base, target_schema, report_path, no_artwork)
-    _not_implemented(ctx, "convert")
+    """Convert a rekordbox USB export into an Engine Library on the same drive.
+
+    Reads PIONEER/export.pdb + USBANLZ, then writes Engine Library/Database2/m.db.
+    Music files are referenced where they already are — nothing is copied and
+    nothing outside Engine Library/ is written.
+
+    Exit codes: 0 clean, 1 converted with skips, 2 fatal (nothing usable written).
+    """
+    if drive is None:
+        raise click.UsageError("DRIVE is required (the mount point of the stick)")
+
+    # Imported lazily so `--help` and `--version` stay fast and do not pull in
+    # the parser/writer stack.
+    from rb2engine.reader.library import read_library
+    from rb2engine.report import ConversionReport
+    from rb2engine.writer.build import build_library
+
+    schema: tuple[int, int, int] | None = None
+    if target_schema:
+        try:
+            parts = tuple(int(p) for p in target_schema.split("."))
+        except ValueError as exc:
+            raise click.UsageError(
+                f"--target-schema must look like 3.0.2, got {target_schema!r}"
+            ) from exc
+        if len(parts) != 3:
+            raise click.UsageError(
+                f"--target-schema must have three parts, got {target_schema!r}"
+            )
+        schema = (parts[0], parts[1], parts[2])
+
+    report = ConversionReport()
+    try:
+        library = read_library(drive, with_anlz=True, with_artwork=not no_artwork)
+
+        if dry_run:
+            click.echo(
+                f"dry run: {len(library.tracks)} tracks, "
+                f"{len(library.playlists)} playlists — nothing written"
+            )
+            ctx.exit(0)
+
+        m_db = build_library(
+            library,
+            drive_root=drive,
+            report=report,
+            path_base=path_base or "engine-lib",
+            target_schema=schema,
+            database_uuid=database_uuid,
+            with_artwork=not no_artwork,
+        )
+    except UnsupportedFormatError as exc:
+        click.echo(f"unsupported: {exc}", err=True)
+        report.fatal, report.fatal_message = True, str(exc)
+        _emit_report(report, drive, report_path)
+        ctx.exit(2)
+    except FatalError as exc:
+        click.echo(f"conversion failed: {exc}", err=True)
+        report.fatal, report.fatal_message = True, str(exc)
+        _emit_report(report, drive, report_path)
+        ctx.exit(2)
+
+    _emit_report(report, drive, report_path)
+    counters = report.counters
+    click.echo(
+        f"converted {counters.tracks_converted} tracks and "
+        f"{counters.playlists_converted} playlists -> {m_db}"
+    )
+    if counters.tracks_skipped:
+        click.echo(f"{counters.tracks_skipped} track(s) skipped — see the report")
+        ctx.exit(1)
+    ctx.exit(0)
 
 
 @main.command("verify")

@@ -1,9 +1,9 @@
-"""Source artwork: mutagen embedded tags (primary); PIONEER/Artwork/ (secondary).
+"""Source artwork: embedded tags (primary); PIONEER/Artwork/ (secondary).
 
 Image bytes never live in the IR long-term: SourceArtwork carries a Path +
 content_key; call read_artwork_bytes when the writer needs the BLOB payload.
 
-Read-only with respect to audio files — never mutagen save() / re-tag.
+Read-only with respect to audio files — never re-tag or rewrite audio.
 """
 
 from __future__ import annotations
@@ -13,11 +13,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mutagen import File as MutagenFile
-from mutagen.mp4 import MP4
-
 from rb2engine.ir import SourceArtwork
 from rb2engine.ir_engine import artwork_content_hash
+from rb2engine.reader.tags import embedded_cover_bytes
 
 SOURCE_EMBEDDED = "embedded"
 SOURCE_PDB = "pdb"
@@ -42,72 +40,13 @@ def _looks_like_image(data: bytes) -> bool:
     return bool(data.startswith(b"RIFF") and data[8:12] == b"WEBP")
 
 
-def _picture_bytes_from_mutagen(audio: object) -> bytes | None:
-    """Return the first usable embedded picture payload, or None."""
-    if audio is None:
-        return None
-
-    pictures = getattr(audio, "pictures", None)
-    if pictures:
-        data = getattr(pictures[0], "data", None)
-        if data:
-            return bytes(data)
-
-    tags = getattr(audio, "tags", None)
-    if tags is None:
-        return None
-
-    # MP4 / M4A `covr`
-    if isinstance(audio, MP4) or (hasattr(tags, "__contains__") and "covr" in tags):
-        try:
-            covers = tags["covr"]  # type: ignore[index]
-        except (KeyError, TypeError, AttributeError, ValueError):
-            covers = None
-        if covers:
-            return bytes(covers[0])
-
-    # ID3 APIC / PIC — MP3, AIFF, WAV (and other ID3FileType containers)
-    try:
-        keys = list(tags.keys())  # type: ignore[attr-defined]
-    except (TypeError, AttributeError, ValueError):
-        return None
-
-    frames: list[object] = []
-    for key in keys:
-        sk = str(key)
-        if sk.startswith(("APIC", "PIC")):
-            frames.append(tags[key])  # type: ignore[index]
-    if not frames:
-        return None
-
-    # Prefer front cover (PictureType 3) when present.
-    for frame in frames:
-        ptype = getattr(frame, "type", None)
-        data = getattr(frame, "data", None)
-        if data and ptype is not None and int(ptype) == 3:
-            return bytes(data)
-    data = getattr(frames[0], "data", None)
-    return bytes(data) if data else None
-
-
 def _read_embedded_image_bytes(track_path: Path) -> bytes | None:
     """Open audio read-only and return embedded image bytes, or None.
 
     Corrupt/undecodable payloads warn and return None — never raise.
     """
     path = Path(track_path)
-    try:
-        audio = MutagenFile(path)
-    except Exception as exc:  # noqa: BLE001 - unreadable file is skipped+reported, never fatal
-        _warn(f"artwork: cannot open {path}: {exc}")
-        return None
-    if audio is None:
-        return None
-    try:
-        image = _picture_bytes_from_mutagen(audio)
-    except Exception as exc:  # noqa: BLE001 - corrupt art is skipped+reported, never fatal
-        _warn(f"artwork: failed reading embedded picture from {path}: {exc}")
-        return None
+    image = embedded_cover_bytes(path)
     if not image:
         return None
     if not _looks_like_image(image):
@@ -207,7 +146,7 @@ def collect_artwork(
 ) -> ArtworkIndex:
     """Batch extract with content_key dedup and a source availability report.
 
-    Primary: embedded tags via mutagen.
+    Primary: embedded tags via ``embedded_cover_bytes``.
     Secondary: ``pdb_artwork_by_track`` paths when embedded is absent.
     First-seen track order pins which SourceArtwork is retained per key.
     """

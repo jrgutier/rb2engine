@@ -202,7 +202,7 @@ def _write(path: Path, data: bytes) -> Path:
 
 def test_allowlist_is_exactly_the_five_consumed_fourccs() -> None:
     """G2: only these five are parsed; everything else is structural immunization."""
-    assert ALLOWLIST == frozenset({"PQTZ", "PQT2", "PCOB", "PCO2", "PPTH"})
+    assert frozenset({"PQTZ", "PQT2", "PCOB", "PCO2", "PPTH"}) == ALLOWLIST
 
 
 def test_pssi_version1_does_not_kill_file(tmp_path: Path) -> None:
@@ -421,7 +421,7 @@ def test_malformed_consumed_tag_raises_track_skipped(tmp_path: Path) -> None:
 
     msg = str(ei.value)
     assert "anlz_" in msg  # machine-stable reason prefix
-    reason = getattr(ei.value, "reason_code", None) or msg.split(":")[0]
+    reason = getattr(ei.value, "reason_code", None) or msg.split(":", maxsplit=1)[0]
     assert reason.startswith("anlz_")
 
 

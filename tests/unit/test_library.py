@@ -27,7 +27,7 @@ def test_source_track_carries_analyze_path() -> None:
     the tool degrades to a metadata-only converter — silently losing every
     beatgrid, hot cue and loop, which is the entire product.
     """
-    fields = {f for f in SourceTrack.__dataclass_fields__}
+    fields = set(SourceTrack.__dataclass_fields__)
     assert "analyze_path" in fields
 
 

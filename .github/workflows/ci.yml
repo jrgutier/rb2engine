@@ -31,10 +31,11 @@ jobs:
         run: uv sync --python ${{ matrix.python-version }}
 
       - name: Ruff
-        run: uv run ruff check
+        run: uv run ruff check src/ tests/
 
       - name: Mypy
         run: uv run mypy src/
 
       - name: Pytest
-        run: uv run pytest
+        # real_stick tests need physical hardware; excluded in CI.
+        run: uv run pytest -q -m "not real_stick"

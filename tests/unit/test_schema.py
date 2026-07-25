@@ -36,7 +36,7 @@ def _object_counts(conn: sqlite3.Connection) -> dict[str, int]:
     rows = conn.execute(
         "SELECT type, COUNT(*) FROM sqlite_master GROUP BY type"
     ).fetchall()
-    return {typ: n for typ, n in rows}
+    return dict(rows)
 
 
 def _golden_counts() -> dict[str, int]:

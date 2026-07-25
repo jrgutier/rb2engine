@@ -1,33 +1,71 @@
 [project]
 name = "rb2engine"
 version = "0.1.0"
-description = "Convert rekordbox USB exports to Engine DJ libraries"
+description = "Convert a rekordbox USB export into an Engine DJ library, in place, without duplicating your music"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [{ name = "jrgutier" }]
-dependencies = [
-    "kaitaistruct",
-    "pyrekordbox~=0.4.4",
-    "click",
-    "rich",
-    "mutagen",
+keywords = ["dj", "rekordbox", "engine-dj", "denon", "pioneer", "usb", "beatgrid", "cue"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Utilities",
 ]
+
+# All runtime dependencies are permissively licensed (MIT / BSD), which keeps
+# rb2engine honestly MIT. mutagen (GPL-2.0-or-later) was deliberately removed
+# as a runtime dependency and replaced by reader/tags.py; it remains a DEV
+# dependency only, where it serves as the oracle for the tag-parity tests.
+dependencies = [
+    "construct>=2.10",     # MIT — export.pdb binary parsing
+    "pyrekordbox~=0.4.4",  # MIT — ANLZ tag structures
+    "click>=8.1",          # BSD-3-Clause — CLI
+    "rich>=13",            # MIT — human-readable report/progress
+]
+
+[project.urls]
+Homepage = "https://github.com/jrgutier/rb2engine"
+Repository = "https://github.com/jrgutier/rb2engine"
+Issues = "https://github.com/jrgutier/rb2engine/issues"
 
 [project.scripts]
 rb2engine = "rb2engine.cli:main"
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "hypothesis",
-    "ruff",
-    "mypy",
+    "pytest>=8",
+    "hypothesis>=6",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    # GPL-2.0-or-later — DEV ONLY, never a runtime dependency. Used solely as
+    # the independent oracle that reader/tags.py extracts byte-identical cover
+    # art. Not shipped, not imported by src/.
+    "mutagen>=1.47",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rb2engine"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the sdist lean: ship the package and its captured DDL, not the
+# multi-hundred-MB test corpus or local planning artifacts.
+include = ["src/rb2engine", "README.md", "LICENSE", "NOTICE"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -39,6 +77,57 @@ pythonpath = ["src"]
 [tool.ruff]
 target-version = "py311"
 src = ["src", "tests"]
+line-length = 100
+
+[tool.ruff.lint]
+# Explicit selection so linting is reproducible across ruff releases rather
+# than tracking whatever the current defaults happen to be.
+select = [
+    "E", "W",      # pycodestyle
+    "F",           # pyflakes
+    "I",           # isort
+    "UP",          # pyupgrade
+    "B",           # bugbear
+    "SIM",         # simplify
+    "C4",          # comprehensions
+    "PIE",         # misc lints
+    "RUF",         # ruff-specific
+    "BLE",         # blind except — matters in a parser that must fail loudly
+    "S",           # bandit
+    "PL",          # pylint
+    "PTH",         # prefer pathlib
+    "RET",         # return simplification
+    "ARG",         # unused arguments
+]
+ignore = [
+    # Binary-format code legitimately branches and returns a lot.
+    "PLR0911",  # too many return statements
+    "PLR0912",  # too many branches
+    "PLR0915",  # too many statements
+    "PLR0913",  # too many arguments — the writer contract is explicit by design
+    "PLR0917",  # too many positional arguments
+    "PLR2004",  # magic values — byte offsets and sentinels ARE the spec here
+    # Lazy imports are deliberate: they keep `--help`/`--version` fast and
+    # break import cycles between reader/mapper/writer.
+    "PLC0415",  # import outside top-level
+    # Docstrings use →, —, × etc. for readability; these are not homoglyph bugs.
+    "RUF001", "RUF002", "RUF003",  # ambiguous unicode
+    # Module-level logging configuration state is the normal pattern.
+    "PLW0603",  # global statement
+    "S101",     # assert — used in tests and for internal invariants
+    "RET504",   # named return values aid readability in the mappers
+    "PTH105",   # os.replace is deliberate and clearer than Path.replace here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S105", "S106",  # hardcoded "passwords" are fixture strings
+    "S108",          # "/tmp/..." are path-canonicalization test literals, not real temp files
+    "S324",          # sha1 appears in tests because it is the dedup key under test
+    "ARG001", "ARG002",  # pytest fixtures are injected but not always referenced
+    "E402",          # some tests import after a skip guard
+    "PLR0915",
+]
 
 [tool.mypy]
 python_version = "3.11"
@@ -46,8 +135,8 @@ mypy_path = "src"
 packages = ["rb2engine"]
 strict = false
 
-# construct, pyrekordbox and mutagen ship no type stubs / py.typed marker.
-# Their absence is a fact about upstream, not a defect here.
+# construct and pyrekordbox ship no type stubs / py.typed marker. Their absence
+# is a fact about upstream, not a defect here.
 [[tool.mypy.overrides]]
-module = ["construct.*", "pyrekordbox.*", "mutagen.*"]
+module = ["construct.*", "pyrekordbox.*"]
 ignore_missing_imports = true

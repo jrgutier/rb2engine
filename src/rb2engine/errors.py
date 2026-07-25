@@ -1,4 +1,9 @@
-"""Exception types: UnsupportedFormatError (fatal, exit 2), TrackSkipped (soft, exit 1), FatalError (exit 2)."""
+"""Exit-code carrying exception types.
+
+UnsupportedFormatError — fatal, exit 2
+TrackSkipped           — soft, exit 1
+FatalError             — fatal, exit 2
+"""
 
 
 class UnsupportedFormatError(Exception):

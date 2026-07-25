@@ -189,10 +189,7 @@ def read_anlz(
         warnings.append("pqt2_without_pqtz")
 
     # Prefer PCO2 (extended colors/names) when any PCO2 tag was present.
-    if saw_pco2_tag:
-        cues = pco2_cues
-    else:
-        cues = pcob_cues
+    cues = pco2_cues if saw_pco2_tag else pcob_cues
 
     return grid, cues, warnings
 
