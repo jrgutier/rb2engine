@@ -1,0 +1,16 @@
+# Captured Engine DDL must be byte-identical on every platform.
+#
+# test_schema_pin.py pins each file by content hash, so any EOL translation on
+# checkout (Windows defaults to CRLF) changes the bytes and fails the pin — a
+# false positive that hides the real signal the test exists for. `-text`
+# disables all EOL conversion, so what we hash is what ships.
+*.sql -text
+
+# Binary fixtures: never translate.
+*.db -text
+*.bin -text
+*.png -text
+*.jpg -text
+
+# Everything else: normalize to LF in the repo.
+* text=auto eol=lf
