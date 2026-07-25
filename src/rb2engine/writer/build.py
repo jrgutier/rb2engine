@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from pathlib import Path
 
@@ -35,6 +36,12 @@ ENGINE_LIBRARY_DIRNAME = "Engine Library"
 DATABASE2_DIRNAME = "Database2"
 M_DB_NAME = "m.db"
 M_DB_TMP_NAME = "m.db.tmp"
+
+# Determinism pin for columns that Engine DDL triggers stamp with strftime('%s')
+# (Track.lastEditTime on PerformanceData UPDATE) and for opaque Information
+# fields that create_m_db may mint randomly. Fixed epoch 0 — not wall-clock.
+_DETERMINISTIC_EPOCH = 0
+_DETERMINISTIC_PLAYED_INDICATOR = 0
 
 # Default when the drive has no prior m.db and the caller did not pin a schema.
 # Engine DJ 4.3.0 desktop / many sticks use 3.0.1; a pre-existing m.db's triple
@@ -141,11 +148,15 @@ def build_library(
         report.counters.playlists_read = len(lib.playlists)
 
         # --- artwork (optional) ------------------------------------------------
+        # Walk tracks in sorted rb_id order so AlbumArt AUTOINCREMENT ids (and
+        # therefore every Track.albumArtId) are stable across runs regardless of
+        # SourceLibrary.tracks dict insertion order.
         art_ids: dict[str, int] = {}
         arts: list[SourceArtwork] = []
         if with_artwork:
             seen: set[str] = set()
-            for src in lib.tracks.values():
+            for rb_id in sorted(lib.tracks.keys()):
+                src = lib.tracks[rb_id]
                 if src.artwork is None:
                     report.counters.artwork_missing += 1
                     continue
@@ -248,6 +259,11 @@ def build_library(
         os.replace(tmp_path, m_db_path)
         _fsync_dir(db2)
 
+        # macOS + FAT32 can leave an AppleDouble sidecar (._m.db) beside the
+        # database after the copy/replace step. Remove only our own published
+        # file's sidecar — never a blanket ._ * sweep of the user's metadata.
+        _remove_appledouble_sidecar_for(m_db_path)
+
         return m_db_path
 
     except Exception as exc:
@@ -324,8 +340,52 @@ def _read_prior_identity(
     return schema, uuid_val
 
 
+def _pin_deterministic_columns(conn: sqlite3.Connection) -> None:
+    """Overwrite wall-clock / random values so re-runs dump identically.
+
+    Engine's captured DDL triggers set ``Track.lastEditTime = strftime('%s')``
+    when PerformanceData blobs are updated. ``create_m_db`` may also mint a
+    random ``currentPlayedIndiciator``. Neither may leak into a canonical dump:
+    two conversions spanning a second boundary would otherwise diverge.
+    """
+    conn.execute(
+        "UPDATE Track SET lastEditTime = ?",
+        (_DETERMINISTIC_EPOCH,),
+    )
+    conn.execute(
+        "UPDATE Information SET currentPlayedIndiciator = ?",
+        (_DETERMINISTIC_PLAYED_INDICATOR,),
+    )
+    conn.commit()
+
+
+def _remove_appledouble_sidecar_for(db_path: Path) -> None:
+    """Remove macOS AppleDouble sidecar for the published m.db only.
+
+    Surgical by construction: only ``._`` + the basename we just wrote
+    (``._m.db``), in the same directory. No-op on non-macOS. Never deletes
+    ``._hm.db``, ``._Music``, or any other user/sibling metadata.
+    """
+    if sys.platform != "darwin":
+        return
+    db_path = Path(db_path)
+    if db_path.name != M_DB_NAME:
+        return
+    sidecar = db_path.with_name(f"._{db_path.name}")
+    if not sidecar.is_file():
+        return
+    try:
+        sidecar.unlink()
+        logger.debug("removed AppleDouble sidecar %s", sidecar)
+    except OSError as exc:
+        logger.warning("could not remove AppleDouble sidecar %s: %s", sidecar, exc)
+
+
 def _finalize(conn: sqlite3.Connection) -> None:
-    """G4: integrity_check + foreign_key_check before the swap is allowed."""
+    """G4: pin determinism columns, then integrity_check + foreign_key_check."""
+    # Pin before integrity so the published DB is the deterministic one.
+    _pin_deterministic_columns(conn)
+
     # Prefer database.finalize if the database worker provided it.
     from rb2engine.writer import database as database_mod
 

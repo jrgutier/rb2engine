@@ -1,10 +1,9 @@
 """click app: convert | inspect | verify | doctor; exit codes 0/1/2.
 
-``convert`` and ``inspect`` are implemented. ``verify`` and ``doctor`` exit 2
-with an honest "not implemented yet" message rather than pretending success.
-
-``inspect`` is strictly read-only: it never writes under the drive, and exits
-0 even when the source library carries warnings/skips (inspection ≠ conversion).
+All four commands are implemented. ``inspect``, ``verify`` and ``doctor`` are
+strictly read-only; only ``convert`` writes, and only inside Engine Library/.
+``inspect`` exits 0 even when the source carries warnings or skips —
+inspection is not conversion.
 """
 
 from __future__ import annotations
@@ -170,11 +169,6 @@ def inspect_cmd(
     ctx.exit(0)
 
 
-def _not_implemented(ctx: click.Context, name: str) -> None:
-    click.echo(f"{name} is not implemented yet", err=True)
-    ctx.exit(2)
-
-
 def _emit_report(
     report: ConversionReport,
     drive: Path | None,
@@ -317,11 +311,42 @@ def convert_cmd(
     type=click.Path(exists=False, path_type=Path),
     required=False,
 )
+@click.option(
+    "--sample",
+    type=int,
+    default=None,
+    help="Check only the first N tracks (a full library over USB is slow).",
+)
+@click.option("--no-artwork", is_flag=True, help="Skip artwork comparison.")
 @click.pass_context
-def verify_cmd(ctx: click.Context, drive: Path | None) -> None:
-    """Decode written m.db and diff against source IR (not yet implemented)."""
-    _ = drive
-    _not_implemented(ctx, "verify")
+def verify_cmd(
+    ctx: click.Context, drive: Path | None, sample: int | None, no_artwork: bool
+) -> None:
+    """Decode the written m.db and diff it against a fresh parse of the source.
+
+    Turns "I checked a few tracks in Engine" into a mechanical check across the
+    whole library: beatgrid markers, cue pads, colours, labels and loop points
+    are compared at sample granularity.
+
+    Read-only. Exit codes: 0 everything matches, 1 discrepancies found,
+    2 could not verify (no library, unreadable, unsupported schema).
+    """
+    if drive is None:
+        raise click.UsageError("DRIVE is required (the mount point of the stick)")
+
+    from rb2engine.verify import verify_library
+
+    try:
+        result = verify_library(drive, with_artwork=not no_artwork, sample=sample)
+    except (FatalError, UnsupportedFormatError) as exc:
+        click.echo(f"cannot verify: {exc}", err=True)
+        ctx.exit(2)
+    except Exception as exc:  # noqa: BLE001 - top-level guard: exit 2, never a traceback
+        click.echo(f"verify failed: {exc}", err=True)
+        ctx.exit(2)
+
+    click.echo(result.render_text())
+    ctx.exit(0 if result.ok else 1)
 
 
 @main.command("doctor")
@@ -331,11 +356,32 @@ def verify_cmd(ctx: click.Context, drive: Path | None) -> None:
     default=None,
     help="Existing Engine m.db to check schema support for.",
 )
+@click.argument(
+    "drive",
+    type=click.Path(exists=False, path_type=Path),
+    required=False,
+)
 @click.pass_context
-def doctor_cmd(ctx: click.Context, engine_db: Path | None) -> None:
-    """Report tool version, bundled DDL versions, schema support (not yet implemented)."""
-    _ = engine_db
-    _not_implemented(ctx, "doctor")
+def doctor_cmd(ctx: click.Context, engine_db: Path | None, drive: Path | None) -> None:
+    """Report versions, bundled schema support, and what's on a drive.
+
+    Run this first when something looks wrong, or before converting an
+    unfamiliar stick. Strictly read-only — it never writes anything.
+
+    Exit codes: 0 everything looks convertible, 1 something needs your
+    attention (e.g. an unsupported schema).
+    """
+    from rb2engine.doctor import doctor_report
+
+    try:
+        result = doctor_report(engine_db=engine_db, drive_root=drive)
+    except Exception as exc:  # noqa: BLE001 - diagnostics must never traceback
+        click.echo(f"doctor failed: {exc}", err=True)
+        ctx.exit(2)
+
+    for line in result.lines:
+        click.echo(line)
+    ctx.exit(0 if result.ok else 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

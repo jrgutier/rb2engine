@@ -580,8 +580,124 @@ def test_g1b_unknown_page_type_on_unconsumed_table_warns(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Gate G1a — duplicate page_type in the table list
+# ---------------------------------------------------------------------------
+
+
+def test_g1a_duplicate_page_type_first_wins_with_warning(tmp_path: Path) -> None:
+    """Two header entries with the same page_type: first-wins + warning, not silent.
+
+    WHY: accidental last-wins (or undetermined) behaviour would make conversion
+    depend on header-order luck. The policy is explicit: keep the first pointer,
+    warn about the later one, continue. Fatal is defensible too, but first-wins
+    keeps usable sticks alive when the second entry is garbage.
+    """
+    len_page = 512
+    pages = {
+        0: _file_header(
+            len_page=len_page,
+            tables=[
+                (0, 1, 1),  # tracks
+                (7, 2, 2),  # playlist_tree
+                (8, 3, 3),  # playlist_entries — FIRST (track 100)
+                (8, 5, 5),  # playlist_entries — DUPLICATE (track 999 must be ignored)
+            ],
+        ),
+        1: _build_nondata_page(
+            len_page=len_page, page_index=1, page_type=0, next_page=99
+        ),
+        2: _build_data_page(
+            len_page=len_page,
+            page_index=2,
+            page_type=7,
+            next_page=99,
+            row_blobs=[
+                _playlist_tree_row(
+                    parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="Dup"
+                )
+            ],
+        ),
+        3: _build_data_page(
+            len_page=len_page,
+            page_index=3,
+            page_type=8,
+            next_page=99,
+            row_blobs=[_playlist_entry_row(0, 100, 1)],
+        ),
+        5: _build_data_page(
+            len_page=len_page,
+            page_index=5,
+            page_type=8,
+            next_page=99,
+            row_blobs=[_playlist_entry_row(0, 999, 1)],
+        ),
+    }
+    pdb_path = tmp_path / "dup_type.pdb"
+    _write_pdb(pdb_path, len_page, pages)
+
+    lib = parse_export_pdb(pdb_path, tmp_path)
+
+    assert lib.playlists[0].track_rb_ids == [100], (
+        "first-wins required: second playlist_entries table must be ignored"
+    )
+    assert any(
+        "duplicate" in w.lower() and "page_type=8" in w for w in lib.warnings
+    ), f"expected duplicate page_type warning, got {lib.warnings!r}"
+
+
+# ---------------------------------------------------------------------------
 # Gate G1c — required missing / optional-consumed malformed
 # ---------------------------------------------------------------------------
+
+
+def _minimal_required_pages(
+    len_page: int,
+    *,
+    include_artists: bool = False,
+    artist_page: bytes | None = None,
+) -> dict[int, bytes]:
+    """Hand-built required tables (tracks / tree / entries) for G1c fixtures."""
+    tables: list[tuple[int, int, int]] = [
+        (0, 1, 1),  # tracks
+        (7, 2, 2),  # playlist_tree
+        (8, 3, 3),  # playlist_entries
+    ]
+    pages: dict[int, bytes] = {
+        1: _build_nondata_page(
+            len_page=len_page, page_index=1, page_type=0, next_page=99
+        ),
+        2: _build_data_page(
+            len_page=len_page,
+            page_index=2,
+            page_type=7,
+            next_page=99,
+            row_blobs=[
+                _playlist_tree_row(
+                    parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="P"
+                )
+            ],
+        ),
+        3: _build_data_page(
+            len_page=len_page,
+            page_index=3,
+            page_type=8,
+            next_page=99,
+            row_blobs=[],
+        ),
+    }
+    if include_artists:
+        tables.insert(1, (2, 4, 4))  # artists
+        if artist_page is None:
+            artist_page = _build_data_page(
+                len_page=len_page,
+                page_index=4,
+                page_type=2,
+                next_page=99,
+                row_blobs=[_artist_row(7, "Cour T_")],
+            )
+        pages[4] = artist_page
+    pages[0] = _file_header(len_page=len_page, tables=tables)
+    return pages
 
 
 def test_g1c_missing_tracks_table_raises(tmp_path: Path) -> None:
@@ -621,37 +737,31 @@ def test_g1c_missing_tracks_table_raises(tmp_path: Path) -> None:
         parse_export_pdb(pdb_path, tmp_path)
 
 
-def test_g1c_malformed_artists_table_raises(tmp_path: Path) -> None:
-    """artists is optional-but-consumed: present-but-unparseable is fatal.
+@pytest.mark.parametrize(
+    "missing_type,match",
+    [
+        (0, "tracks"),
+        (7, "playlist_tree"),
+        (8, "playlist_entries"),
+    ],
+)
+def test_g1c_missing_required_table_raises(
+    tmp_path: Path, missing_type: int, match: str
+) -> None:
+    """Each required table is independently fatal when absent.
 
-    Silently zeroing every artist name is the exact plausible-wrong-output
-    failure the plan warns about (N1 / G1c).
+    WHY: a missing playlist_tree is not "no playlists" — it means the export
+    is incomplete. Softening any of these to empty would invent structure.
     """
     len_page = 512
-    # Artists page claims one present row but the row body is truncated junk.
-    junk_page = bytearray(len_page)
-    junk_page[0:PAGE_HEADER] = _page_header(
-        page_index=4,
-        page_type=2,
-        next_page=99,
-        num_row_offsets=1,
-        num_rows=1,
-        page_flags=0x24,
-    )
-    # Point row 0 at offset 0 with only 2 garbage bytes — too short for artist_row.
-    junk_page[PAGE_HEADER : PAGE_HEADER + 2] = b"\xff\xff"
-    _pack_row_index(junk_page, len_page, [0])
-
+    all_required = [
+        (0, 1, 1),
+        (7, 2, 2),
+        (8, 3, 3),
+    ]
+    tables = [t for t in all_required if t[0] != missing_type]
     pages = {
-        0: _file_header(
-            len_page=len_page,
-            tables=[
-                (0, 1, 1),
-                (2, 4, 4),  # artists present but bad
-                (7, 2, 2),
-                (8, 3, 3),
-            ],
-        ),
+        0: _file_header(len_page=len_page, tables=tables),
         1: _build_nondata_page(
             len_page=len_page, page_index=1, page_type=0, next_page=99
         ),
@@ -662,7 +772,7 @@ def test_g1c_malformed_artists_table_raises(tmp_path: Path) -> None:
             next_page=99,
             row_blobs=[
                 _playlist_tree_row(
-                    parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="P"
+                    parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="X"
                 )
             ],
         ),
@@ -673,8 +783,107 @@ def test_g1c_malformed_artists_table_raises(tmp_path: Path) -> None:
             next_page=99,
             row_blobs=[],
         ),
-        4: bytes(junk_page),
     }
+    pdb_path = tmp_path / f"no_{match}.pdb"
+    _write_pdb(pdb_path, len_page, pages)
+
+    with pytest.raises(UnsupportedFormatError, match=match):
+        parse_export_pdb(pdb_path, tmp_path)
+
+
+def test_g1c_missing_optional_artists_tolerated_and_counted(tmp_path: Path) -> None:
+    """artists is optional-consumed: absence is OK but must be counted.
+
+    WHY: without a warning, "no artist names because the table was never
+    listed" is indistinguishable from "FKs resolve to empty" — the plan
+    requires absence of optional-consumed tables to be visible, not silent.
+    """
+    len_page = 512
+    pages = _minimal_required_pages(len_page, include_artists=False)
+    pdb_path = tmp_path / "no_artists.pdb"
+    _write_pdb(pdb_path, len_page, pages)
+
+    lib = parse_export_pdb(pdb_path, tmp_path)
+
+    assert any(
+        "artists" in w.lower() and "absent" in w.lower() for w in lib.warnings
+    ), f"expected counted absence warning, got {lib.warnings!r}"
+    # Must not be fatal — complementary to present-but-unparseable.
+    assert len(lib.playlists) == 1
+
+
+def test_g1c_corrupt_artists_table_byte_patched_raises(tmp_path: Path) -> None:
+    """Byte-patch a *valid* artists page so present-but-unparseable is fatal.
+
+    WHY: silently zeroing every artist name is the exact plausible-wrong-output
+    failure G1c/N1 exists to block. Building junk from scratch is easy to get
+    wrong about layout; patching a known-good page at test time (no committed
+    binary) proves the gate fires on real-layout corruption — not a silent
+    skip, and not an uncaught stack trace.
+    """
+    len_page = 512
+    pages = _minimal_required_pages(len_page, include_artists=True)
+    valid_path = tmp_path / "artists_ok.pdb"
+    _write_pdb(valid_path, len_page, pages)
+
+    # Unpatched copy must parse — otherwise the fixture is wrong, not the gate.
+    lib_ok = parse_export_pdb(valid_path, tmp_path)
+    assert len(lib_ok.playlists) == 1
+
+    # Byte-patch a COPY: keep header + table pointers, replace the artists data
+    # page with a present row whose body is garbage (not a silent empty table).
+    blob = bytearray(valid_path.read_bytes())
+    artists_page_idx = 4
+    page_start = artists_page_idx * len_page
+    junk = bytearray(len_page)
+    junk[0:PAGE_HEADER] = _page_header(
+        page_index=artists_page_idx,
+        page_type=2,  # ARTISTS
+        next_page=99,
+        num_row_offsets=1,
+        num_rows=1,
+        page_flags=0x24,  # data page
+    )
+    # Present bit set, row at heap offset 0, only 2 garbage payload bytes —
+    # forces the artist row parser (or DeviceSQL decode) to fail loud.
+    junk[PAGE_HEADER : PAGE_HEADER + 2] = b"\xff\xff"
+    _pack_row_index(junk, len_page, [0])
+    blob[page_start : page_start + len_page] = junk
+
+    corrupt_path = tmp_path / "corrupt_artists.pdb"
+    corrupt_path.write_bytes(bytes(blob))
+
+    with pytest.raises(UnsupportedFormatError, match="artists") as exc_info:
+        parse_export_pdb(corrupt_path, tmp_path)
+
+    msg = str(exc_info.value).lower()
+    assert "unparseable" in msg or "artists" in msg
+    # Fail-loud with a typed error — not a bare Exception / traceback path.
+    assert type(exc_info.value) is UnsupportedFormatError
+
+
+def test_g1c_malformed_artists_table_raises(tmp_path: Path) -> None:
+    """artists is optional-but-consumed: present-but-unparseable is fatal.
+
+    Kept as a direct (non-patch) construction for clarity; the byte-patched
+    fixture above is the plan's required pinning form.
+    """
+    len_page = 512
+    junk_page = bytearray(len_page)
+    junk_page[0:PAGE_HEADER] = _page_header(
+        page_index=4,
+        page_type=2,
+        next_page=99,
+        num_row_offsets=1,
+        num_rows=1,
+        page_flags=0x24,
+    )
+    junk_page[PAGE_HEADER : PAGE_HEADER + 2] = b"\xff\xff"
+    _pack_row_index(junk_page, len_page, [0])
+
+    pages = _minimal_required_pages(
+        len_page, include_artists=True, artist_page=bytes(junk_page)
+    )
     pdb_path = tmp_path / "bad_artists.pdb"
     _write_pdb(pdb_path, len_page, pages)
 

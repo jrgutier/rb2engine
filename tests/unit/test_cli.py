@@ -159,25 +159,19 @@ def test_subcommand_help(runner: CliRunner, cmd: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["verify", "DRIVE"],
-        ["doctor"],  # doctor takes --engine-db, not a positional drive
-    ],
-)
-def test_unimplemented_exits_two_not_zero(
-    runner: CliRunner, args: list[str], tmp_path: Path
-) -> None:
-    """Unimplemented must exit 2 with an honest message — never pretend success."""
-    drive = tmp_path / "stick"
-    drive.mkdir()
-    argv = [a if a != "DRIVE" else str(drive) for a in args]
-    result = runner.invoke(main, argv)
-    assert result.exit_code == 2, f"{argv} exit={result.exit_code} out={result.output!r}"
-    assert result.exit_code != 0
-    combined = (result.output + (result.stderr or "")).lower()
-    assert "not implemented" in combined or "not yet" in combined
+def test_every_command_is_implemented(runner: CliRunner) -> None:
+    """No command may claim "not implemented" — the CLI surface is complete.
+
+    This replaces the old unimplemented-stub test, which went stale three
+    times as convert, then verify, then doctor landed. Asserting the absence
+    of stubs is the durable form.
+    """
+    for cmd in ("convert", "inspect", "verify", "doctor"):
+        result = runner.invoke(main, [cmd, "--help"])
+        assert result.exit_code == 0, f"{cmd} --help failed"
+        combined = (result.output + (result.stderr or "")).lower()
+        assert "not implemented" not in combined
+        assert "not yet" not in combined
 
 
 def test_convert_on_non_stick_exits_two(runner: CliRunner, tmp_path: Path) -> None:

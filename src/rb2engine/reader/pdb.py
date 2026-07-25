@@ -476,13 +476,35 @@ def _load_id_name_table(
 
 def _table_map(
     header_tables: list,
+    warnings: list[str],
 ) -> dict[int, tuple[int, int]]:
-    """page_type → (first_page, last_page). First-wins on duplicates."""
+    """page_type → (first_page, last_page).
+
+    G1a policy for duplicate ``page_type`` entries: **first-wins with a warning**.
+
+    Why first-wins rather than fatal: Pioneer writers emit each type once; a
+    second pointer for the same type is almost always corruption or an
+    accidental double-list, not two legitimate tables. Keeping the first
+    pointer preserves a usable library when the later entry is garbage, while
+    still recording the anomaly so it cannot pass unnoticed. Fatal rejection
+    would discard sticks that otherwise convert correctly. Do not silently
+    take the last entry — that would make behaviour depend on header order
+    accidents.
+    """
     out: dict[int, tuple[int, int]] = {}
     for t in header_tables:
         ptype = int(t.page_type)
-        if ptype not in out:
-            out[ptype] = (int(t.first_page), int(t.last_page))
+        first, last = int(t.first_page), int(t.last_page)
+        if ptype in out:
+            kept = out[ptype]
+            warnings.append(
+                f"duplicate page_type={ptype} in export.pdb header "
+                f"(first_page={first}, last_page={last}); "
+                f"keeping first pointer first_page={kept[0]} last_page={kept[1]}, "
+                f"ignoring later entry"
+            )
+            continue
+        out[ptype] = (first, last)
     return out
 
 
@@ -511,8 +533,8 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
 
     header = _parse_file_header(data)
     len_page = int(header.len_page)
-    tables = _table_map(list(header.tables))
     warnings: list[str] = []
+    tables = _table_map(list(header.tables), warnings)
 
     # G1b: unknown page_type values on tables we do not consume.
     for t in header.tables:
@@ -556,13 +578,24 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
     for pt, parser, label, target in optional_loaders:
         b = _bounds(pt)
         if b is None:
-            continue  # optional absence is fine
+            # G1c: optional-consumed absence is tolerated but counted. Losing
+            # the warning would make "every artist name empty because the table
+            # was never listed" indistinguishable from "every name empty
+            # because FKs point at nothing" — counted so it is visible.
+            warnings.append(
+                f"optional table {label} (page_type={int(pt)}) absent; "
+                f"related fields will be empty"
+            )
+            continue
         first, last = b
         try:
             target.update(
                 _load_id_name_table(data, len_page, first, last, pt, parser, label)
             )
         except UnsupportedFormatError as exc:
+            # Present-but-unparseable is fatal for the whole consumed set —
+            # silently zeroing every artist/album/… name is the
+            # "plausible-looking wrong output" failure G1c exists to block.
             raise UnsupportedFormatError(
                 f"export.pdb {label} table present but unparseable: {exc}"
             ) from exc
