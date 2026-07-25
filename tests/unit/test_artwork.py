@@ -238,7 +238,10 @@ def test_extract_engine_golden_png_embedded(tmp_path: Path) -> None:
     those exact bytes so the writer can assert byte-equality later.
     """
     golden = _GOLDEN_PNG.read_bytes()
-    assert len(golden) == 69_592
+    # Size is incidental — the fixture is a synthetic PNG (the original was a
+    # commercial cover, removed before publishing). What matters is that the
+    # exact bytes survive extraction.
+    assert golden.startswith(b"\x89PNG\r\n\x1a\n")
     track = _mp3_with_apic(tmp_path / "golden.mp3", golden)
 
     art = extract_artwork(track)
