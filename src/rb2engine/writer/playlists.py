@@ -22,6 +22,7 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping, MutableMapping, Sequence
 
+from rb2engine.chain import walk_entity_chain
 from rb2engine.ir import SourcePlaylist
 
 # Engine / libdjinterop sentinel: tail of every next*Id chain.
@@ -264,48 +265,6 @@ def insert_playlists(
     return len(playlists)
 
 
-def _walk_entity_chain(
-    list_id: int, rows: Sequence[tuple[int, int, int]]
-) -> list[int]:
-    """Track order for one list, walked through ``nextEntityId`` like Engine.
-
-    Walking the chain rather than reading the raw rows is deliberate: a row that
-    exists but is unreachable, or one spliced into the middle, is invisible to a
-    plain ``SELECT ... ORDER BY id`` and is exactly the defect this must catch.
-    """
-    by_next: dict[int, tuple[int, int]] = {}
-    for eid, tid, nxt in rows:
-        # Two rows sharing a successor would silently collapse into one dict
-        # entry. The count check below would still fire, but it would blame the
-        # wrong thing, so name this corruption for what it is.
-        if int(nxt) in by_next:
-            raise RuntimeError(
-                f"playlist listId={list_id}: two PlaylistEntity rows share "
-                f"nextEntityId={int(nxt)} — chain is forked"
-            )
-        by_next[int(nxt)] = (int(eid), int(tid))
-
-    order: list[int] = []
-    curr = _NO_NEXT
-    seen: set[int] = set()
-    while curr in by_next:
-        eid, track_id = by_next[curr]
-        if eid in seen:  # corrupt chain must not spin forever
-            break
-        seen.add(eid)
-        order.insert(0, track_id)
-        curr = eid
-
-    # A row that no chain walk reaches is still a row Engine may honour; make
-    # the count mismatch loud instead of letting the walk hide it.
-    if len(order) != len(rows):
-        raise RuntimeError(
-            f"playlist listId={list_id}: {len(rows)} PlaylistEntity rows but the "
-            f"nextEntityId chain reaches {len(order)} — chain is inconsistent"
-        )
-    return order
-
-
 def assert_entities_match_intent(
     conn: sqlite3.Connection, intended: Mapping[int, Sequence[int]]
 ) -> None:
@@ -337,7 +296,7 @@ def assert_entities_match_intent(
         )
 
     for list_id, expected in intended.items():
-        actual = _walk_entity_chain(list_id, grouped.get(list_id, []))
+        actual = walk_entity_chain(list_id, grouped.get(list_id, []))
         if list(actual) != list(expected):
             extra = sorted(set(actual) - set(expected))
             missing = sorted(set(expected) - set(actual))

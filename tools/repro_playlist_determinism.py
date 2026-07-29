@@ -59,9 +59,6 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-# Engine sentinel: tail of a nextEntityId chain.
-_NO_NEXT = 0
-
 # Scratch library name used for builds. Distinct from "Engine Library" so a
 # crash can never leave the user's real library half-written.
 _SCRATCH_LIBRARY = "Engine Library.repro"
@@ -100,29 +97,29 @@ def entity_chains(m_db: Path) -> dict[str, list[int]]:
     Order is reconstructed through ``nextEntityId`` exactly as Engine reads it,
     so a chain that is corrupt in a way row order would hide still shows up.
     """
+    from rb2engine.chain import ChainInconsistent, walk_entity_chain
+
     conn = sqlite3.connect(f"file:{m_db}?mode=ro", uri=True)
     try:
         titles = {int(i): str(t) for i, t in conn.execute("SELECT id, title FROM Playlist")}
         out: dict[str, list[int]] = {}
         for list_id, title in titles.items():
-            rows = conn.execute(
-                "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
-                (list_id,),
-            ).fetchall()
-            by_next = {int(n): (int(e), int(t)) for e, t, n in rows}
-            order: list[int] = []
-            curr, seen = _NO_NEXT, set()
-            while curr in by_next:
-                eid, track_id = by_next[curr]
-                if eid in seen:  # cycle guard — a corrupt chain must not hang
-                    break
-                seen.add(eid)
-                order.insert(0, track_id)
-                curr = eid
-            # Rows unreachable from the chain are themselves a defect; surface
-            # them rather than reporting a shorter, tidier list.
-            if len(order) != len(rows):
-                order.append(-len(rows))  # sentinel makes the mismatch visible
+            rows = [
+                (int(e), int(t), int(n))
+                for e, t, n in conn.execute(
+                    "SELECT id, trackId, nextEntityId FROM PlaylistEntity "
+                    "WHERE listId = ?",
+                    (list_id,),
+                )
+            ]
+            try:
+                order = walk_entity_chain(list_id, rows)
+            except ChainInconsistent as exc:
+                # Fold the problem into the fingerprint so a run that corrupts a
+                # chain cannot compare equal to a run that did not.
+                order = [t for _, t, _ in rows]
+                out[f"{title}#{list_id}!chain"] = [len(rows), len(order)]
+                print(f"    chain problem on {title!r}: {exc}")
             out[f"{title}#{list_id}"] = order
         return out
     finally:
