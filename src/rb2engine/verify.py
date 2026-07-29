@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from rb2engine.chain import ChainInconsistent, walk_entity_chain
 from rb2engine.errors import FatalError
 from rb2engine.ir import SourceLibrary, SourcePlaylist, SourceTrack
 from rb2engine.ir_engine import artwork_content_hash
@@ -33,9 +34,6 @@ M_DB_NAME = "m.db"
 
 # Empty-slot sentinel shared with writer/blobs and ir_engine.
 _EMPTY_SAMPLE = -1.0
-
-# Engine / libdjinterop: tail of every nextEntityId chain.
-_NO_NEXT = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,7 +561,18 @@ def _compare_playlists(
         expected_track_ids = _expected_entity_track_ids(
             pl, source, by_path=by_path, drive_root=drive_root, engine_lib=engine_lib
         )
-        actual_track_ids = _entity_track_order(conn, list_id)
+        actual_track_ids, chain_problem = _entity_track_order(conn, list_id)
+        if chain_problem is not None:
+            # Report it in its own right: a broken chain is a defect even when
+            # the set of tracks happens to match what the source expected.
+            discrepancies.append(
+                Discrepancy(
+                    track_id=None,
+                    field=f"playlist[{pl.name}].chain",
+                    expected="every row reachable from the nextEntityId chain",
+                    actual=chain_problem,
+                )
+            )
         if expected_track_ids != actual_track_ids:
             discrepancies.append(
                 Discrepancy(
@@ -615,25 +624,32 @@ def _expected_entity_track_ids(
     return out
 
 
-def _entity_track_order(conn: sqlite3.Connection, list_id: int) -> list[int]:
-    """Reconstruct track order from nextEntityId (tail sentinel = 0)."""
-    rows = conn.execute(
-        "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
-        (list_id,),
-    ).fetchall()
-    by_next = {int(next_id): (int(eid), int(track_id)) for eid, track_id, next_id in rows}
-    order: list[int] = []
-    curr = _NO_NEXT
-    # Guard against cycles in a corrupted chain.
-    seen_entity: set[int] = set()
-    while curr in by_next:
-        eid, track_id = by_next[curr]
-        if eid in seen_entity:
-            break
-        seen_entity.add(eid)
-        order.insert(0, track_id)
-        curr = eid
-    return order
+def _entity_track_order(
+    conn: sqlite3.Connection, list_id: int
+) -> tuple[list[int], str | None]:
+    """Track order from the nextEntityId chain, plus any inconsistency found.
+
+    Returns ``(order, problem)``. ``problem`` is None when the chain accounts
+    for every row; otherwise it describes what is wrong and ``order`` holds the
+    rows in id order as a best effort.
+
+    This used to swallow an inconsistent chain and return the shorter, tidier
+    list, which reported a clean library while the writer's own gate would
+    refuse to publish that exact database. Both now walk the same code
+    (``rb2engine.chain``); they differ only in how they react, because ``verify``
+    must record the finding and keep checking rather than abort.
+    """
+    rows = [
+        (int(eid), int(track_id), int(next_id))
+        for eid, track_id, next_id in conn.execute(
+            "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
+            (list_id,),
+        )
+    ]
+    try:
+        return walk_entity_chain(list_id, rows), None
+    except ChainInconsistent as exc:
+        return [track_id for _, track_id, _ in rows], str(exc)
 
 
 def _compare_artwork(

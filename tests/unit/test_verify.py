@@ -1104,10 +1104,14 @@ def test_verify_catches_extra_playlist_count(
 def test_verify_playlist_chain_cycle_does_not_hang(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cyclic nextEntityId chain must terminate and still flag bad order.
+    """A cyclic nextEntityId chain must terminate and still be flagged.
 
     WHY: Without a cycle guard, a corrupted stick could hang verify forever —
     worse than reporting a discrepancy.
+
+    The cycle orphans e3, so it surfaces as a `.chain` discrepancy naming the
+    unreachable row. It used to be reported only indirectly, as whatever track
+    order the truncated walk happened to produce.
     """
     from rb2engine.verify import verify_library
 
@@ -1134,7 +1138,41 @@ def test_verify_playlist_chain_cycle_does_not_hang(
 
     result = verify_library(drive, with_artwork=False)
     assert result.ok is False
-    assert "playlist[Main Set].track_order" in _fields(result.discrepancies)
+    assert "playlist[Main Set].chain" in _fields(result.discrepancies)
+
+
+def test_verify_reports_unreachable_entity_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An orphaned row must be reported, not quietly dropped from the order.
+
+    WHY: verify used to walk the chain and return whatever it reached, so a row
+    Engine may still honour vanished from the comparison and the library was
+    reported clean — while the writer's own gate refuses to publish that exact
+    database. Both now share rb2engine.chain, so they cannot disagree about
+    whether there is a defect.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    entities = conn.execute(
+        "SELECT id FROM PlaylistEntity WHERE listId = 1 ORDER BY id"
+    ).fetchall()
+    e2, e3 = entities[1][0], entities[2][0]
+    # Make e2 the tail and strand e3 behind a successor id that does not exist.
+    # The chain is otherwise well-formed, so only the row count reveals e3.
+    conn.execute("UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = ?", (e2,))
+    conn.execute("UPDATE PlaylistEntity SET nextEntityId = 8888 WHERE id = ?", (e3,))
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+    assert result.ok is False
+    fields = _fields(result.discrepancies)
+    assert "playlist[Main Set].chain" in fields
 
 
 def test_verify_playlist_skips_unknown_and_unresolved_source_tracks(

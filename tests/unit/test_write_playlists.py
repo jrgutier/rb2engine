@@ -19,11 +19,11 @@ from pathlib import Path
 
 import pytest
 
+from rb2engine.chain import walk_entity_chain
 from rb2engine.ir import SourcePlaylist
 from rb2engine.writer import playlists as playlists_mod
 from rb2engine.writer import schema as schema_mod
 from rb2engine.writer.playlists import (
-    _walk_entity_chain,
     assert_entities_match_intent,
     insert_playlists,
 )
@@ -306,7 +306,7 @@ def _chain(conn: sqlite3.Connection, list_id: int) -> list[int]:
         "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
         (list_id,),
     ).fetchall()
-    return _walk_entity_chain(list_id, [(int(a), int(b), int(c)) for a, b, c in rows])
+    return walk_entity_chain(list_id, [(int(a), int(b), int(c)) for a, b, c in rows])
 
 
 def test_integrity_gate_accepts_a_faithful_write(tmp_path: Path) -> None:
@@ -330,7 +330,7 @@ def test_insert_playlists_actually_invokes_the_gate(
     """
     monkeypatch.setattr(
         playlists_mod,
-        "_walk_entity_chain",
+        "walk_entity_chain",
         lambda _list_id, rows: [*(int(t) for _, t, _ in rows), 4242],
     )
     playlists = [
