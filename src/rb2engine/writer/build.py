@@ -23,6 +23,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 
 from rb2engine.errors import FatalError
@@ -190,6 +191,7 @@ def build_library(
     # Late imports keep this module importable while sibling writer modules
     # land (concurrent workers). Contract signatures are fixed.
     from rb2engine.writer import database as database_mod
+    from rb2engine.writer import playlists as playlists_mod
     from rb2engine.writer.playlists import insert_playlists
 
     conn: sqlite3.Connection | None = None
@@ -315,8 +317,12 @@ def build_library(
         # --- playlists ---------------------------------------------------------
         if on_progress is not None:
             on_progress("playlists", 0, 0)
+        intended_playlists: dict[int, Sequence[int]] = {}
         n_playlists = insert_playlists(
-            conn, lib.playlists, track_id_map=track_id_map or {}
+            conn,
+            lib.playlists,
+            track_id_map=track_id_map or {},
+            intended_out=intended_playlists,
         )
         report.counters.playlists_converted = n_playlists
 
@@ -342,6 +348,25 @@ def build_library(
 
         _fsync_file(tmp_path)
         _fsync_dir(db2)
+
+        # Re-check the copy that actually crossed to the target volume.
+        #
+        # The check inside insert_playlists runs in the writing transaction, so
+        # it can only prove SQLite agreed with us at that moment — it cannot see
+        # the commit, the half-gigabyte copy over USB, or this volume's driver.
+        # A conversion once published playlists containing a track that was in
+        # no source playlist and still exited 0, and the staged database is
+        # discarded before anyone can compare it, so this is the last point
+        # where that class of corruption is still catchable. Running it before
+        # os.replace means a failure leaves the user's previous m.db in place.
+        if intended_playlists:
+            check_conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+            try:
+                playlists_mod.assert_entities_match_intent(
+                    check_conn, intended_playlists
+                )
+            finally:
+                check_conn.close()
 
         os.replace(tmp_path, m_db_path)
         _fsync_dir(db2)
