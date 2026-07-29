@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 
 from rb2engine.ir import SourcePlaylist
 
@@ -39,6 +39,7 @@ def insert_playlists(
     playlists: Sequence[SourcePlaylist],
     *,
     track_id_map: Mapping[int, int],
+    intended_out: MutableMapping[int, Sequence[int]] | None = None,
 ) -> int:
     """Insert Playlist + PlaylistEntity rows for *playlists*.
 
@@ -53,6 +54,11 @@ def insert_playlists(
     track_id_map:
         ``SourceTrack.rb_id`` → Engine ``Track.id``. Entries whose rb_id is
         missing are skipped (soft track skips must not fail playlist write).
+    intended_out:
+        Optional sink receiving ``listId`` → intended track order. The caller
+        needs it to re-check the database *after* it has been committed and
+        copied to the target volume; the in-transaction check below cannot see
+        that far.
 
     Returns
     -------
@@ -194,6 +200,9 @@ def insert_playlists(
     next_entity_id = 1
 
     duplicate_entries = 0
+    # listId → the exact track order this function intends to write. Kept so
+    # the write can be read back and checked against intent (see below).
+    intended: dict[int, list[int]] = {}
     for rb_id, pl in by_rb.items():
         list_id = engine_id_of[rb_id]
         # Preserve source order; drop members whose tracks were skipped.
@@ -219,6 +228,7 @@ def insert_playlists(
             continue
 
         n = len(engine_track_ids)
+        intended[list_id] = engine_track_ids
         entity_ids = list(range(next_entity_id, next_entity_id + n))
         next_entity_id += n
         for i, track_id in enumerate(engine_track_ids):
@@ -240,6 +250,10 @@ def insert_playlists(
         )
         _bump_sequence(conn, "PlaylistEntity", next_entity_id - 1)
 
+    assert_entities_match_intent(conn, intended)
+    if intended_out is not None:
+        intended_out.update(intended)
+
     if duplicate_entries:
         logger.warning(
             "dropped %d duplicate playlist entrie(s): rekordbox allows the same "
@@ -248,6 +262,91 @@ def insert_playlists(
         )
 
     return len(playlists)
+
+
+def _walk_entity_chain(
+    list_id: int, rows: Sequence[tuple[int, int, int]]
+) -> list[int]:
+    """Track order for one list, walked through ``nextEntityId`` like Engine.
+
+    Walking the chain rather than reading the raw rows is deliberate: a row that
+    exists but is unreachable, or one spliced into the middle, is invisible to a
+    plain ``SELECT ... ORDER BY id`` and is exactly the defect this must catch.
+    """
+    by_next: dict[int, tuple[int, int]] = {}
+    for eid, tid, nxt in rows:
+        # Two rows sharing a successor would silently collapse into one dict
+        # entry. The count check below would still fire, but it would blame the
+        # wrong thing, so name this corruption for what it is.
+        if int(nxt) in by_next:
+            raise RuntimeError(
+                f"playlist listId={list_id}: two PlaylistEntity rows share "
+                f"nextEntityId={int(nxt)} — chain is forked"
+            )
+        by_next[int(nxt)] = (int(eid), int(tid))
+
+    order: list[int] = []
+    curr = _NO_NEXT
+    seen: set[int] = set()
+    while curr in by_next:
+        eid, track_id = by_next[curr]
+        if eid in seen:  # corrupt chain must not spin forever
+            break
+        seen.add(eid)
+        order.insert(0, track_id)
+        curr = eid
+
+    # A row that no chain walk reaches is still a row Engine may honour; make
+    # the count mismatch loud instead of letting the walk hide it.
+    if len(order) != len(rows):
+        raise RuntimeError(
+            f"playlist listId={list_id}: {len(rows)} PlaylistEntity rows but the "
+            f"nextEntityId chain reaches {len(order)} — chain is inconsistent"
+        )
+    return order
+
+
+def assert_entities_match_intent(
+    conn: sqlite3.Connection, intended: Mapping[int, Sequence[int]]
+) -> None:
+    """Read every written chain back and fail if it differs from intent.
+
+    The writer builds each chain in memory and inserts it in one pass, so in
+    principle the database must agree. In practice a conversion shipped two
+    playlists containing a track that appeared nowhere in the source, and
+    ``convert`` still exited 0 — the corruption was only found later by
+    ``verify``. Checking here turns that class of silent wrong-database into a
+    build-time failure, before the new m.db is swapped into place.
+
+    Every row in the table is examined, not just the lists we meant to fill: a
+    spurious row landing on a folder or an empty playlist is precisely as wrong
+    as one landing on a playlist we wrote, and scoping the check to *intended*
+    would leave that whole class invisible.
+    """
+    grouped: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+    for list_id, eid, tid, nxt in conn.execute(
+        "SELECT listId, id, trackId, nextEntityId FROM PlaylistEntity"
+    ):
+        grouped[int(list_id)].append((int(eid), int(tid), int(nxt)))
+
+    unexpected_lists = sorted(set(grouped) - set(intended))
+    if unexpected_lists:
+        raise RuntimeError(
+            f"PlaylistEntity rows exist for listId(s) {unexpected_lists} that "
+            "no playlist write intended"
+        )
+
+    for list_id, expected in intended.items():
+        actual = _walk_entity_chain(list_id, grouped.get(list_id, []))
+        if list(actual) != list(expected):
+            extra = sorted(set(actual) - set(expected))
+            missing = sorted(set(expected) - set(actual))
+            raise RuntimeError(
+                f"playlist listId={list_id}: written entries do not match the "
+                f"{len(expected)} intended ({len(actual)} written; "
+                f"unexpected track ids {extra or 'none'}; "
+                f"absent track ids {missing or 'none'})"
+            )
 
 
 def _bump_sequence(conn: sqlite3.Connection, table: str, seq: int) -> None:

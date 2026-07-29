@@ -17,9 +17,16 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from rb2engine.ir import SourcePlaylist
+from rb2engine.writer import playlists as playlists_mod
 from rb2engine.writer import schema as schema_mod
-from rb2engine.writer.playlists import insert_playlists
+from rb2engine.writer.playlists import (
+    _walk_entity_chain,
+    assert_entities_match_intent,
+    insert_playlists,
+)
 
 # Engine / libdjinterop sentinel: tail of every next*Id chain points at 0.
 _NO_NEXT = 0
@@ -259,5 +266,189 @@ def test_returns_zero_for_empty_input(tmp_path: Path) -> None:
     try:
         assert insert_playlists(conn, [], track_id_map={}) == 0
         assert conn.execute("SELECT COUNT(*) FROM Playlist").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Post-write integrity gate
+#
+# A real conversion shipped two playlists each containing one track that
+# appeared nowhere in the corresponding source playlist, and `convert` still
+# exited 0 — only a later `verify` caught it. insert_playlists now reads its
+# own chains back and refuses to hand over a database that disagrees with what
+# it meant to write. A check that cannot fail would be worthless, so these
+# tests corrupt the chain deliberately and require the failure.
+# ---------------------------------------------------------------------------
+
+
+def _seed_one_playlist(tmp_path: Path) -> tuple[sqlite3.Connection, int, list[int]]:
+    """Write a single 3-track playlist and return (conn, list_id, track_ids)."""
+    playlists = [
+        SourcePlaylist(
+            rb_id=1,
+            parent_rb_id=0,
+            name="PL",
+            sort_order=0,
+            is_folder=False,
+            track_rb_ids=[10, 20, 30],
+        )
+    ]
+    conn = _open_empty_db(tmp_path)
+    insert_playlists(conn, playlists, track_id_map={10: 101, 20: 102, 30: 103})
+    conn.commit()
+    list_id = conn.execute("SELECT id FROM Playlist").fetchone()[0]
+    return conn, int(list_id), [101, 102, 103]
+
+
+def _chain(conn: sqlite3.Connection, list_id: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
+        (list_id,),
+    ).fetchall()
+    return _walk_entity_chain(list_id, [(int(a), int(b), int(c)) for a, b, c in rows])
+
+
+def test_integrity_gate_accepts_a_faithful_write(tmp_path: Path) -> None:
+    """The gate must stay silent on a correct chain, or it is just noise."""
+    conn, list_id, tracks = _seed_one_playlist(tmp_path)
+    try:
+        assert _chain(conn, list_id) == tracks
+        assert_entities_match_intent(conn, {list_id: tracks})
+    finally:
+        conn.close()
+
+
+def test_insert_playlists_actually_invokes_the_gate(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The wiring itself must be able to fail, not just the helper.
+
+    Without this, deleting the call from insert_playlists leaves every other
+    test in this file green — the gate would be dead code and nothing would say
+    so.
+    """
+    monkeypatch.setattr(
+        playlists_mod,
+        "_walk_entity_chain",
+        lambda _list_id, rows: [*(int(t) for _, t, _ in rows), 4242],
+    )
+    playlists = [
+        SourcePlaylist(
+            rb_id=1,
+            parent_rb_id=0,
+            name="PL",
+            sort_order=0,
+            is_folder=False,
+            track_rb_ids=[10],
+        )
+    ]
+    conn = _open_empty_db(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="4242"):
+            insert_playlists(conn, playlists, track_id_map={10: 101})
+    finally:
+        conn.close()
+
+
+def test_integrity_gate_catches_row_on_an_unintended_list(tmp_path: Path) -> None:
+    """A spurious row on a folder or empty playlist is just as wrong."""
+    conn, list_id, tracks = _seed_one_playlist(tmp_path)
+    try:
+        conn.execute(
+            "INSERT INTO PlaylistEntity (id, listId, trackId, databaseUuid, "
+            "nextEntityId, membershipReference) VALUES (?, ?, ?, ?, 0, 0)",
+            (9003, list_id + 500, 997, "test-uuid-playlists"),
+        )
+        conn.commit()
+        with pytest.raises(RuntimeError, match="no playlist write intended"):
+            assert_entities_match_intent(conn, {list_id: tracks})
+    finally:
+        conn.close()
+
+
+def test_integrity_gate_catches_extra_track_spliced_into_chain(
+    tmp_path: Path,
+) -> None:
+    """The observed defect: one track present that the source never had.
+
+    The spurious row is spliced *into* the chain rather than appended, which is
+    where it was found on the real stick (second to last), so a check that only
+    compared lengths at the tail would miss it.
+    """
+    conn, list_id, tracks = _seed_one_playlist(tmp_path)
+    try:
+        # Point the middle entity at a new row, and that row at the old tail.
+        tail_id = conn.execute(
+            "SELECT id FROM PlaylistEntity WHERE listId = ? AND nextEntityId = 0",
+            (list_id,),
+        ).fetchone()[0]
+        prev_id = conn.execute(
+            "SELECT id FROM PlaylistEntity WHERE listId = ? AND nextEntityId = ?",
+            (list_id, tail_id),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO PlaylistEntity (id, listId, trackId, databaseUuid, "
+            "nextEntityId, membershipReference) VALUES (?, ?, ?, ?, ?, 0)",
+            (9001, list_id, 999, "test-uuid-playlists", tail_id),
+        )
+        conn.execute(
+            "UPDATE PlaylistEntity SET nextEntityId = ? WHERE id = ?",
+            (9001, prev_id),
+        )
+        conn.commit()
+
+        assert 999 in _chain(conn, list_id)
+        with pytest.raises(RuntimeError, match="999"):
+            assert_entities_match_intent(conn, {list_id: tracks})
+    finally:
+        conn.close()
+
+
+def test_integrity_gate_catches_unreachable_row(tmp_path: Path) -> None:
+    """A row no chain walk reaches is still a row Engine may honour."""
+    conn, list_id, tracks = _seed_one_playlist(tmp_path)
+    try:
+        conn.execute(
+            "INSERT INTO PlaylistEntity (id, listId, trackId, databaseUuid, "
+            "nextEntityId, membershipReference) VALUES (?, ?, ?, ?, ?, 0)",
+            (9002, list_id, 998, "test-uuid-playlists", 4242),
+        )
+        conn.commit()
+        with pytest.raises(RuntimeError, match="chain is inconsistent"):
+            assert_entities_match_intent(conn, {list_id: tracks})
+    finally:
+        conn.close()
+
+
+def test_integrity_gate_catches_dropped_track(tmp_path: Path) -> None:
+    """Losing an entry must fail as loudly as gaining one.
+
+    The row is removed from the database and the predecessor is re-pointed at
+    its successor, so this is a genuine dropped entry with an intact chain —
+    not merely a corrupted expectation.
+    """
+    conn, list_id, tracks = _seed_one_playlist(tmp_path)
+    try:
+        tail_id, tail_track = conn.execute(
+            "SELECT id, trackId FROM PlaylistEntity "
+            "WHERE listId = ? AND nextEntityId = 0",
+            (list_id,),
+        ).fetchone()
+        prev_id = conn.execute(
+            "SELECT id FROM PlaylistEntity WHERE listId = ? AND nextEntityId = ?",
+            (list_id, tail_id),
+        ).fetchone()[0]
+        # Drop the DELETE trigger's rewiring out of the picture by repairing the
+        # predecessor ourselves, so the chain stays well-formed.
+        conn.execute("DELETE FROM PlaylistEntity WHERE id = ?", (tail_id,))
+        conn.execute(
+            "UPDATE PlaylistEntity SET nextEntityId = 0 WHERE id = ?", (prev_id,)
+        )
+        conn.commit()
+
+        assert tail_track not in _chain(conn, list_id)
+        with pytest.raises(RuntimeError, match="absent track ids"):
+            assert_entities_match_intent(conn, {list_id: tracks})
     finally:
         conn.close()
