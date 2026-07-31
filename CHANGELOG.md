@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-07-31
+
+### Fixed
+- `convert` no longer publishes a database whose playlist chains disagree with
+  what it meant to write. A conversion on a real stick published two playlists
+  that each contained one track appearing nowhere in the corresponding source
+  playlist — and `convert` still exited 0. Only a later `verify` found it. The
+  root cause is *not* fixed here; it has not been identified, and the failure
+  did not recur across four faithful rebuilds. What is fixed is that this class
+  of corruption could be published silently. The check runs twice: inside the
+  writing transaction, and again on the copy that actually crossed to the
+  target volume, after fsync and before `os.replace`. A failure there leaves
+  your previous `m.db` byte-for-byte intact.
+- `verify` and the writer no longer disagree about what a valid
+  `PlaylistEntity` chain is. verify walked a broken chain, returned whatever it
+  reached, and reported the library clean — so verify would pass a database
+  that `convert` would refuse to write. One walker (`rb2engine/chain.py`) now
+  backs both, and a chain problem is reported in its own right as a
+  `playlist[NAME].chain` discrepancy, because a broken chain is a defect even
+  when the set of tracks still matches what the source expected.
+
+### Testing
+- 688 tests, 87% branch coverage.
+
+## [0.3.1] - 2026-07-25
+
+### Fixed
+- Unicode path matching. `export.pdb` stores paths composed (NFC), while the
+  same names read back off the stick arrive decomposed (NFD), so every track
+  with an accented character anywhere in its path resolved to nothing and was
+  reported as `skipped: resolved_path is None` — while the file sat there,
+  present and playable. On a real 3,666-track stick that was 46 tracks. The
+  filesystem hid it: macOS resolves NFC against NFD inside the syscall, so
+  `exists()` on the very same path returned true.
+
+### Added
+- `convert` reports progress per phase on stderr. Disabled when stderr is not a
+  TTY and under `--log-json`, which owns that stream.
+
 ## [0.3.0] - 2026-07-25
 
 ### Added
