@@ -1048,13 +1048,19 @@ def test_verify_catches_playlist_rename(
     assert d.actual == "absent"
 
 
-def test_verify_resolves_duplicate_playlist_title_suffix(
+def test_verify_reports_externally_renamed_playlist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Engine renames collisions to 'Name (2)'; verify must still find the list.
+    """A list retitled in the database must be reported, not silently matched.
 
-    WHY: insert_playlists suffixes duplicates. If verify only did exact title
-    match, every second playlist named 'Main Set' would false-fail as missing.
+    WHY: the writer only produces a " (N)" suffix when the SOURCE holds two
+    playlists of that name in one folder — see
+    test_verify_pairs_same_folder_duplicates_with_their_own_lists, which covers
+    that case. With a single source playlist no rename can occur, so a database
+    titled "Main Set (2)" has been changed by something other than us. Treating
+    it as a match assumes the database is right whenever its title merely looks
+    like a rename, which is how "House" came to be verified against the
+    unrelated list "House (old)".
     """
     from rb2engine.verify import verify_library
 
@@ -1062,7 +1068,6 @@ def test_verify_resolves_duplicate_playlist_title_suffix(
     _patch_read_library(monkeypatch, lib)
 
     conn = sqlite3.connect(str(m_db))
-    # Simulate Engine's duplicate-title suffix without changing entity chain.
     conn.execute(
         "UPDATE Playlist SET title = ? WHERE title = ?",
         ("Main Set (2)", "Main Set"),
@@ -1071,10 +1076,9 @@ def test_verify_resolves_duplicate_playlist_title_suffix(
     conn.close()
 
     result = verify_library(drive, with_artwork=False)
-    # Must NOT report playlist[Main Set].missing — suffix scan finds it.
-    assert "playlist[Main Set].missing" not in _fields(result.discrepancies)
-    # Track order still comparable via the resolved list id.
-    assert result.ok is True
+
+    assert result.ok is False
+    assert "playlist[Main Set].missing" in _fields(result.discrepancies)
 
 
 def test_verify_catches_extra_playlist_count(
@@ -1397,3 +1401,198 @@ def test_verify_catches_empty_artwork_blob(
 
     assert not result.ok
     assert any(".bytes" in d.field for d in result.discrepancies)
+
+
+# ---------------------------------------------------------------------------
+# Playlist pairing — verify must compare each source list against ITS OWN
+# engine list. Getting this wrong invents discrepancies on a faithful build,
+# which is worse than missing one: it trains the operator to ignore verify.
+# ---------------------------------------------------------------------------
+
+
+def _build_with_playlists(
+    tmp_path: Path, playlists: list[SourcePlaylist]
+) -> tuple[Path, SourceLibrary, Path]:
+    """Build a 3-track library with caller-supplied playlists."""
+    drive = tmp_path / "stick"
+    drive.mkdir()
+    (drive / "Contents").mkdir()
+    (drive / "PIONEER").mkdir()
+
+    tracks = {
+        10: _source_track(10, drive=drive, title="Alpha", filename="a.mp3"),
+        20: _source_track(20, drive=drive, title="Beta", filename="b.mp3"),
+        30: _source_track(30, drive=drive, title="Gamma", filename="c.mp3"),
+    }
+    lib = SourceLibrary(
+        drive_root=drive, tracks=tracks, playlists=playlists, warnings=[]
+    )
+    m_db = build_library(
+        lib, drive_root=drive, report=ConversionReport(), with_artwork=False
+    )
+    return drive, lib, m_db
+
+
+def test_verify_pairs_same_name_playlists_in_different_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same title under two different folders must not collapse to one list.
+
+    WHY: Engine's uniqueness constraint is per-parent, so "Chill" may legally
+    exist in several folders. Keying the lookup on title alone makes the last
+    row scanned win, and every same-named list is then compared against that
+    one — reporting a wrong-tracks discrepancy on a build that is correct.
+    """
+    from rb2engine.verify import verify_library
+
+    playlists = [
+        SourcePlaylist(
+            rb_id=1, parent_rb_id=0, name="Folder A", sort_order=0,
+            is_folder=True, track_rb_ids=[],
+        ),
+        SourcePlaylist(
+            rb_id=2, parent_rb_id=0, name="Folder B", sort_order=1,
+            is_folder=True, track_rb_ids=[],
+        ),
+        SourcePlaylist(
+            rb_id=3, parent_rb_id=1, name="Chill", sort_order=0,
+            is_folder=False, track_rb_ids=[10, 20],
+        ),
+        SourcePlaylist(
+            rb_id=4, parent_rb_id=2, name="Chill", sort_order=0,
+            is_folder=False, track_rb_ids=[10, 30],
+        ),
+    ]
+    drive, lib, _ = _build_with_playlists(tmp_path, playlists)
+    _patch_read_library(monkeypatch, lib)
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.ok is True, (
+        "faithful build reported discrepancies: "
+        f"{[(d.field, d.expected, d.actual) for d in result.discrepancies]}"
+    )
+
+
+def test_verify_pairs_same_folder_duplicates_with_their_own_lists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Renamed duplicates must each verify against the list they became.
+
+    WHY: rekordbox allows two playlists of the same name in one folder; the
+    writer renames the second to "Name (2)". Both source lists still carry the
+    original name, so an exact-title lookup resolves BOTH to the first engine
+    list — the second is then diffed against the first's tracks.
+    """
+    from rb2engine.verify import verify_library
+
+    playlists = [
+        SourcePlaylist(
+            rb_id=1, parent_rb_id=0, name="Sets", sort_order=0,
+            is_folder=True, track_rb_ids=[],
+        ),
+        SourcePlaylist(
+            rb_id=2, parent_rb_id=1, name="Setlist", sort_order=0,
+            is_folder=False, track_rb_ids=[10, 20],
+        ),
+        SourcePlaylist(
+            rb_id=3, parent_rb_id=1, name="Setlist", sort_order=1,
+            is_folder=False, track_rb_ids=[10, 30],
+        ),
+    ]
+    drive, lib, m_db = _build_with_playlists(tmp_path, playlists)
+    _patch_read_library(monkeypatch, lib)
+
+    # Precondition: the writer really did rename the second duplicate.
+    conn = sqlite3.connect(str(m_db))
+    titles = {
+        str(r[0]) for r in conn.execute("SELECT title FROM Playlist").fetchall()
+    }
+    conn.close()
+    assert {"Setlist", "Setlist (2)"} <= titles, titles
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.ok is True, (
+        "faithful build reported discrepancies: "
+        f"{[(d.field, d.expected, d.actual) for d in result.discrepancies]}"
+    )
+
+
+def test_verify_does_not_match_unrelated_suffixed_playlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing "House" must not silently resolve to "House (old)".
+
+    WHY: the duplicate-suffix scan matches any title starting with "House (",
+    which is a real, differently-named playlist — not a rename of this one. The
+    absent list is then reported as a track mismatch against an unrelated set
+    instead of as missing, pointing the operator at the wrong playlist.
+    """
+    from rb2engine.verify import verify_library
+
+    playlists = [
+        SourcePlaylist(
+            rb_id=1, parent_rb_id=0, name="House", sort_order=0,
+            is_folder=False, track_rb_ids=[10, 20],
+        ),
+        SourcePlaylist(
+            rb_id=2, parent_rb_id=0, name="House (old)", sort_order=1,
+            is_folder=False, track_rb_ids=[30],
+        ),
+    ]
+    drive, lib, m_db = _build_with_playlists(tmp_path, playlists)
+    _patch_read_library(monkeypatch, lib)
+
+    # Drop the "House" list so its lookup genuinely fails.
+    conn = sqlite3.connect(str(m_db))
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("DELETE FROM Playlist WHERE title = 'House'")
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.ok is False
+    fields = _fields(result.discrepancies)
+    assert "playlist[House].missing" in fields, fields
+    # It must NOT have been diffed against "House (old)".
+    assert "playlist[House].track_order" not in fields, fields
+
+
+def test_db_playlist_paths_survives_a_malformed_parent_chain() -> None:
+    """A cyclic or orphaned parent chain must not hang or crash verify.
+
+    WHY: these paths are walked in a database rb2engine did not necessarily
+    write — Engine and the hardware also modify it. Verify's job on a corrupt
+    library is to report, so the walk has to terminate on structures the writer
+    would have refused to create.
+    """
+    from rb2engine.verify import _db_playlist_paths
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE Playlist (id INTEGER, title TEXT, parentListId INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO Playlist (id, title, parentListId) VALUES (?, ?, ?)",
+        [
+            (1, "Root", 0),
+            (2, "Child", 1),
+            (3, "Orphan", 99),  # parent does not exist
+            (4, "CycleA", 5),  # 4 → 5 → 4
+            (5, "CycleB", 4),
+        ],
+    )
+    conn.commit()
+
+    paths = _db_playlist_paths(conn)
+    conn.close()
+
+    assert paths[("Root",)] == 1
+    assert paths[("Root", "Child")] == 2
+    # Orphan truncates at the missing parent rather than looping forever.
+    assert paths[("Orphan",)] == 3
+    # Both cycle members terminate; each yields a finite path.
+    assert any(p[-1] == "CycleA" for p in paths)
+    assert any(p[-1] == "CycleB" for p in paths)
