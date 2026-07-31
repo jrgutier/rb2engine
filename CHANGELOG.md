@@ -5,6 +5,33 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- `verify` paired each source playlist with the wrong Engine list in three ways,
+  every one of which invents discrepancies on a correct conversion — the failure
+  mode that trains you to ignore verify. Same-named playlists in different
+  folders collapsed onto one list (Engine's uniqueness constraint is
+  per-parent, so this is legal and common); duplicates within one folder all
+  compared against the first, because the writer renames the second to
+  `"Name (2)"` while both source lists keep the original name; and a missing
+  playlist could resolve to an unrelated one whose title merely started the
+  same way, so `"House"` was verified against `"House (old)"`.
+- Playlists are now paired on their full folder path. Engine's
+  unique-name-per-folder renaming lives in one shared module used by both the
+  writer that applies the names and the verifier that has to predict them —
+  verify re-deriving that by hand is what produced all three defects.
+
+### Changed
+- **Breaking (text output).** Playlist discrepancies are keyed by folder path
+  rather than bare name: `playlist[Sets/Setlist].track_order`, previously
+  `playlist[Setlist].track_order`. Nothing parses these keys programmatically,
+  but scripts grepping verify's output will need updating.
+- A playlist retitled in the database is now reported as missing instead of
+  being silently matched when its new title resembles a duplicate suffix. This
+  is divergence from the source and belongs in the report; classifying it as an
+  external edit rather than an absence is follow-up work.
+
 ## [0.3.2] - 2026-07-31
 
 ### Fixed

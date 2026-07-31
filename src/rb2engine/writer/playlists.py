@@ -24,6 +24,7 @@ from collections.abc import Mapping, MutableMapping, Sequence
 
 from rb2engine.chain import walk_entity_chain
 from rb2engine.ir import SourcePlaylist
+from rb2engine.playlist_naming import resolve_titles
 
 # Engine / libdjinterop sentinel: tail of every next*Id chain.
 _NO_NEXT = 0
@@ -142,20 +143,14 @@ def insert_playlists(
     # happened. The suffix is assigned in the already-deterministic sibling
     # order (sort_order, rb_id), so re-runs produce identical names and the
     # determinism guarantee holds.
-    title_of: dict[int, str] = {}
-    renamed: list[tuple[str, str]] = []
-    for group in siblings.values():
-        seen: dict[str, int] = {}
-        for rb in group:  # already sorted by (sort_order, rb_id)
-            original = by_rb[rb].name
-            count = seen.get(original, 0)
-            seen[original] = count + 1
-            if count == 0:
-                title_of[rb] = original
-            else:
-                new_title = f"{original} ({count + 1})"
-                title_of[rb] = new_title
-                renamed.append((original, new_title))
+    # The algorithm lives in playlist_naming so verify predicts exactly what we
+    # write; it must not be reimplemented on either side.
+    title_of = resolve_titles(playlists)
+    renamed: list[tuple[str, str]] = [
+        (by_rb[rb].name, title_of[rb])
+        for rb in by_rb
+        if title_of[rb] != by_rb[rb].name
+    ]
     if renamed:
         logger.warning(
             "renamed %d playlist(s) to satisfy Engine's unique-name-per-folder "

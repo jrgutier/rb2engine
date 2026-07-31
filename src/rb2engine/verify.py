@@ -19,6 +19,7 @@ from rb2engine.errors import FatalError
 from rb2engine.ir import SourceLibrary, SourcePlaylist, SourceTrack
 from rb2engine.ir_engine import artwork_content_hash
 from rb2engine.mapper.track import map_track
+from rb2engine.playlist_naming import format_path, resolve_paths
 from rb2engine.reader.library import read_library
 from rb2engine.writer.blobs import (
     decode_beat_data,
@@ -537,21 +538,23 @@ def _compare_playlists(
             )
         )
 
-    # Title → list id (first match; Engine renames duplicates with " (N)").
-    title_to_id: dict[str, int] = {}
-    for row in conn.execute("SELECT id, title FROM Playlist"):
-        title_to_id[str(row[1])] = int(row[0])
+    # Pair on the whole path, not the title: the same title may legally exist
+    # under several folders (Engine's constraint is per-parent), and duplicates
+    # within one folder are renamed by the writer. Both are predicted by
+    # playlist_naming, which the writer uses to assign the names in the first
+    # place.
+    path_to_id = _db_playlist_paths(conn)
+    source_paths = resolve_paths(source.playlists)
 
     for pl in source.playlists:
-        list_id = title_to_id.get(pl.name)
-        if list_id is None:
-            # Renamed duplicate titles — try ordered suffix scan.
-            list_id = _find_playlist_id(title_to_id, pl)
+        path = source_paths[pl.rb_id]
+        label = format_path(path)
+        list_id = path_to_id.get(path)
         if list_id is None:
             discrepancies.append(
                 Discrepancy(
                     track_id=None,
-                    field=f"playlist[{pl.name}].missing",
+                    field=f"playlist[{label}].missing",
                     expected="present",
                     actual="absent",
                 )
@@ -568,7 +571,7 @@ def _compare_playlists(
             discrepancies.append(
                 Discrepancy(
                     track_id=None,
-                    field=f"playlist[{pl.name}].chain",
+                    field=f"playlist[{label}].chain",
                     expected="every row reachable from the nextEntityId chain",
                     actual=chain_problem,
                 )
@@ -577,23 +580,38 @@ def _compare_playlists(
             discrepancies.append(
                 Discrepancy(
                     track_id=None,
-                    field=f"playlist[{pl.name}].track_order",
+                    field=f"playlist[{label}].track_order",
                     expected=expected_track_ids,
                     actual=actual_track_ids,
                 )
             )
 
 
-def _find_playlist_id(
-    title_to_id: dict[str, int], pl: SourcePlaylist
-) -> int | None:
-    if pl.name in title_to_id:
-        return title_to_id[pl.name]
-    # insert_playlists renames duplicates to "Name (2)", "Name (3)", …
-    for title, lid in title_to_id.items():
-        if title == pl.name or title.startswith(f"{pl.name} ("):
-            return lid
-    return None
+def _db_playlist_paths(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, ...], int]:
+    """Engine playlist path (root first) → list id.
+
+    Built by walking ``parentListId`` to the root, so a title is only ever
+    matched within its own folder.
+    """
+    rows: dict[int, tuple[str, int]] = {
+        int(r[0]): (str(r[1]), int(r[2]))
+        for r in conn.execute("SELECT id, title, parentListId FROM Playlist")
+    }
+    paths: dict[tuple[str, ...], int] = {}
+    for list_id in rows:
+        parts: list[str] = []
+        cur = list_id
+        walked: set[int] = set()
+        # Guard against a cyclic parent chain in a database we did not write.
+        while cur != 0 and cur in rows and cur not in walked:
+            walked.add(cur)
+            title, parent = rows[cur]
+            parts.append(title)
+            cur = parent
+        paths[tuple(reversed(parts))] = list_id
+    return paths
 
 
 def _expected_entity_track_ids(
