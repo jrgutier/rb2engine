@@ -1568,7 +1568,7 @@ def test_db_playlist_paths_survives_a_malformed_parent_chain() -> None:
     library is to report, so the walk has to terminate on structures the writer
     would have refused to create.
     """
-    from rb2engine.verify import _db_playlist_paths
+    from rb2engine.playlist_check import db_playlist_paths as _db_playlist_paths
 
     conn = sqlite3.connect(":memory:")
     conn.execute(

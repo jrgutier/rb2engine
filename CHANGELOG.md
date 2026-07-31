@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`convert` now refuses to publish a database that disagrees with its own
+  source.** Before the new `m.db` is swapped into place, every playlist's
+  membership, order and entry chain is recomputed from the source and compared
+  against what was actually written. On any disagreement the conversion fails
+  with exit 2 and your existing library is left byte-for-byte intact.
+
+  This is deliberately *not* the check added in 0.3.2. That one compares the
+  database against what the writer intended, and both sides of it derive from
+  the same track id map — so a mapping fault agrees with itself and passes. The
+  new check recomputes each expected track id from the source track through the
+  mapper and the database's own path index, never consulting that map, and so
+  fails exactly where the older gate cannot.
+
+  Scope, stated plainly: it is playlist-scoped, not a full verify, and it cannot
+  tell you the source *file* was misread — both sides descend from the same
+  parse. That is the reader's job (see G1d above). `rb2engine verify` remains
+  the field-level check.
+
 ### Fixed
 - **G1d — refuse a torn `export.pdb` instead of converting it.** A conversion on
   a real stick published two playlist entries that the settled `export.pdb` does

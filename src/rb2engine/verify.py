@@ -14,12 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from rb2engine.chain import ChainInconsistent, walk_entity_chain
 from rb2engine.errors import FatalError
-from rb2engine.ir import SourceLibrary, SourcePlaylist, SourceTrack
+from rb2engine.ir import SourceLibrary, SourceTrack
 from rb2engine.ir_engine import artwork_content_hash
 from rb2engine.mapper.track import map_track
-from rb2engine.playlist_naming import format_path, resolve_paths
+from rb2engine.playlist_check import compare_playlists
 from rb2engine.reader.library import read_library
 from rb2engine.writer.blobs import (
     decode_beat_data,
@@ -66,7 +65,13 @@ class VerifyResult:
         return len(self.discrepancies) == 0
 
     def render_text(self) -> str:
-        """Human-readable summary for CLI / convert post-pass."""
+        """Human-readable summary for the ``verify`` command.
+
+        ``convert`` does not render this. It runs its own playlist-scoped
+        recheck before publishing (``playlist_check.compare_playlists``) and
+        refuses rather than reports; a full field-level verify stays an explicit
+        second step.
+        """
         status = "OK" if self.ok else "FAILED"
         lines = [
             "rb2engine verify",
@@ -538,136 +543,25 @@ def _compare_playlists(
             )
         )
 
-    # Pair on the whole path, not the title: the same title may legally exist
-    # under several folders (Engine's constraint is per-parent), and duplicates
-    # within one folder are renamed by the writer. Both are predicted by
-    # playlist_naming, which the writer uses to assign the names in the first
-    # place.
-    path_to_id = _db_playlist_paths(conn)
-    source_paths = resolve_paths(source.playlists)
-
-    for pl in source.playlists:
-        path = source_paths[pl.rb_id]
-        label = format_path(path)
-        list_id = path_to_id.get(path)
-        if list_id is None:
-            discrepancies.append(
-                Discrepancy(
-                    track_id=None,
-                    field=f"playlist[{label}].missing",
-                    expected="present",
-                    actual="absent",
-                )
+    # The comparison itself lives in playlist_check, which the writer's
+    # pre-publish gate also calls. verify records findings and keeps checking;
+    # the writer aborts. They must not disagree about what is wrong.
+    for problem in compare_playlists(
+        source,
+        conn,
+        drive_root=drive_root,
+        engine_lib=engine_lib,
+        track_id_by_path={path: t.id for path, t in by_path.items()},
+    ):
+        discrepancies.append(
+            Discrepancy(
+                track_id=None,
+                field=f"playlist[{problem.label}].{problem.kind}",
+                expected=problem.expected,
+                actual=problem.actual,
             )
-            continue
-
-        expected_track_ids = _expected_entity_track_ids(
-            pl, source, by_path=by_path, drive_root=drive_root, engine_lib=engine_lib
         )
-        actual_track_ids, chain_problem = _entity_track_order(conn, list_id)
-        if chain_problem is not None:
-            # Report it in its own right: a broken chain is a defect even when
-            # the set of tracks happens to match what the source expected.
-            discrepancies.append(
-                Discrepancy(
-                    track_id=None,
-                    field=f"playlist[{label}].chain",
-                    expected="every row reachable from the nextEntityId chain",
-                    actual=chain_problem,
-                )
-            )
-        if expected_track_ids != actual_track_ids:
-            discrepancies.append(
-                Discrepancy(
-                    track_id=None,
-                    field=f"playlist[{label}].track_order",
-                    expected=expected_track_ids,
-                    actual=actual_track_ids,
-                )
-            )
 
-
-def _db_playlist_paths(
-    conn: sqlite3.Connection,
-) -> dict[tuple[str, ...], int]:
-    """Engine playlist path (root first) → list id.
-
-    Built by walking ``parentListId`` to the root, so a title is only ever
-    matched within its own folder.
-    """
-    rows: dict[int, tuple[str, int]] = {
-        int(r[0]): (str(r[1]), int(r[2]))
-        for r in conn.execute("SELECT id, title, parentListId FROM Playlist")
-    }
-    paths: dict[tuple[str, ...], int] = {}
-    for list_id in rows:
-        parts: list[str] = []
-        cur = list_id
-        walked: set[int] = set()
-        # Guard against a cyclic parent chain in a database we did not write.
-        while cur != 0 and cur in rows and cur not in walked:
-            walked.add(cur)
-            title, parent = rows[cur]
-            parts.append(title)
-            cur = parent
-        paths[tuple(reversed(parts))] = list_id
-    return paths
-
-
-def _expected_entity_track_ids(
-    pl: SourcePlaylist,
-    source: SourceLibrary,
-    *,
-    by_path: dict[str, _DbTrack],
-    drive_root: Path,
-    engine_lib: Path,
-) -> list[int]:
-    """Map source track_rb_ids → Engine Track.id via expected path (order preserved)."""
-    out: list[int] = []
-    seen: set[int] = set()
-    for rb in pl.track_rb_ids:
-        src = source.tracks.get(rb)
-        if src is None:
-            continue
-        if src.resolved_path is None:
-            continue
-        et = map_track(src, drive_root=drive_root, engine_library_dir=engine_lib)
-        db = by_path.get(et.path)
-        if db is None:
-            continue
-        if db.id in seen:
-            continue  # Engine de-dupes within a playlist (first occurrence wins)
-        seen.add(db.id)
-        out.append(db.id)
-    return out
-
-
-def _entity_track_order(
-    conn: sqlite3.Connection, list_id: int
-) -> tuple[list[int], str | None]:
-    """Track order from the nextEntityId chain, plus any inconsistency found.
-
-    Returns ``(order, problem)``. ``problem`` is None when the chain accounts
-    for every row; otherwise it describes what is wrong and ``order`` holds the
-    rows in id order as a best effort.
-
-    This used to swallow an inconsistent chain and return the shorter, tidier
-    list, which reported a clean library while the writer's own gate would
-    refuse to publish that exact database. Both now walk the same code
-    (``rb2engine.chain``); they differ only in how they react, because ``verify``
-    must record the finding and keep checking rather than abort.
-    """
-    rows = [
-        (int(eid), int(track_id), int(next_id))
-        for eid, track_id, next_id in conn.execute(
-            "SELECT id, trackId, nextEntityId FROM PlaylistEntity WHERE listId = ?",
-            (list_id,),
-        )
-    ]
-    try:
-        return walk_entity_chain(list_id, rows), None
-    except ChainInconsistent as exc:
-        return [track_id for _, track_id, _ in rows], str(exc)
 
 
 def _compare_artwork(
