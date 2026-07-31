@@ -29,6 +29,7 @@ from pathlib import Path
 from rb2engine.errors import FatalError
 from rb2engine.ir import SourceArtwork, SourceLibrary
 from rb2engine.ir_engine import EngineTrack
+from rb2engine.playlist_check import compare_playlists
 from rb2engine.progress import ProgressCallback, phase_callback
 from rb2engine.report import ConversionReport
 
@@ -359,12 +360,36 @@ def build_library(
         # discarded before anyone can compare it, so this is the last point
         # where that class of corruption is still catchable. Running it before
         # os.replace means a failure leaves the user's previous m.db in place.
-        if intended_playlists:
+        if intended_playlists or lib.playlists:
             check_conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
             try:
-                playlists_mod.assert_entities_match_intent(
-                    check_conn, intended_playlists
+                if intended_playlists:
+                    playlists_mod.assert_entities_match_intent(
+                        check_conn, intended_playlists
+                    )
+
+                # Independent oracle. The check above compares the database
+                # against what insert_playlists *intended*, and both sides of it
+                # descend from track_id_map — so a mapping fault agrees with
+                # itself and passes. This one recomputes every expected track id
+                # from the source through map_track and the database's own path
+                # index, never touching that map, and therefore fails where the
+                # intent check cannot.
+                #
+                # It cannot detect a misread source: both sides descend from the
+                # same parse. That is the reader's job (pdb G1d).
+                problems = compare_playlists(
+                    lib, check_conn, drive_root=drive_root, engine_lib=engine_lib
                 )
+                if problems:
+                    detail = "; ".join(p.describe() for p in problems[:5])
+                    more = (
+                        f" (+{len(problems) - 5} more)" if len(problems) > 5 else ""
+                    )
+                    raise RuntimeError(
+                        "playlist-scoped recheck against the source failed, so "
+                        f"nothing was published: {detail}{more}"
+                    )
             finally:
                 check_conn.close()
 

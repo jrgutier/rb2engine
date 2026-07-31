@@ -1737,3 +1737,144 @@ def test_rmtree_and_appledouble_edge_helpers(tmp_path: Path) -> None:
             build_mod._remove_appledouble_sidecar_for(mdb2)
 
 
+
+
+# ---------------------------------------------------------------------------
+# W1d — independent pre-publish recheck
+#
+# assert_entities_match_intent compares the database against what
+# insert_playlists intended, and both sides descend from track_id_map. A
+# mapping fault therefore agrees with itself and passes. These tests pin the
+# source-derived recheck that does not consult that map.
+# ---------------------------------------------------------------------------
+
+
+def _swapping_insert_tracks(swap: bool):
+    """insert_tracks double that inserts correct rows but may return a bad map."""
+
+    def insert_tracks(
+        conn: sqlite3.Connection,
+        tracks: Sequence[EngineTrack],
+        *,
+        art_ids: Mapping[str, int] | None = None,
+        on_progress: Any = None,
+    ) -> dict[int, int]:
+        row_ids: list[int] = []
+        for et in tracks:
+            cur = conn.execute(
+                "INSERT INTO Track (path, title, artist, originDatabaseUuid, "
+                "originTrackId) VALUES (?, ?, ?, "
+                "(SELECT uuid FROM Information LIMIT 1), ?)",
+                (et.path, et.title, et.artist, 0),
+            )
+            row_ids.append(int(cur.lastrowid))
+        # rb_ids are 1..N in the fixtures below, in the same order as `tracks`.
+        rb_ids = list(range(1, len(tracks) + 1))
+        if swap and len(row_ids) >= 2:
+            row_ids[0], row_ids[1] = row_ids[1], row_ids[0]
+        return dict(zip(rb_ids, row_ids, strict=True))
+
+    return insert_tracks
+
+
+def _two_track_lib(drive: Path) -> SourceLibrary:
+    return SourceLibrary(
+        drive_root=drive,
+        tracks={1: _source_track(1, drive=drive), 2: _source_track(2, drive=drive)},
+        playlists=[
+            SourcePlaylist(
+                rb_id=1,
+                parent_rb_id=0,
+                name="Main",
+                sort_order=0,
+                is_folder=False,
+                track_rb_ids=[1],
+            )
+        ],
+        warnings=[],
+    )
+
+
+def _stick(tmp_path: Path) -> Path:
+    drive = tmp_path / "stick"
+    drive.mkdir()
+    (drive / "Contents").mkdir()
+    (drive / "PIONEER").mkdir()
+    (drive / "Contents" / "1.mp3").write_bytes(b"a")
+    (drive / "Contents" / "2.mp3").write_bytes(b"b")
+    (drive / "PIONEER" / "export.pdb").write_bytes(b"pdb")
+    return drive
+
+
+def test_recheck_catches_a_mapping_fault_the_intent_gate_cannot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrong track_id_map is self-consistent, so only a source-derived check sees it.
+
+    WHY: this is the blind spot W1d exists for. insert_playlists writes the ids
+    the map gave it and then confirms the database holds exactly those, which it
+    does — the playlist is internally coherent and points at the wrong track.
+    Only recomputing from the source catches it, and it must be caught before
+    the database is published rather than by a verify run days later.
+    """
+    import rb2engine.writer.tracks as tracks_mod
+    from rb2engine.writer.build import build_library
+
+    _install_database_fakes(monkeypatch)
+    _install_pipeline_fakes(monkeypatch)
+    monkeypatch.setattr(tracks_mod, "insert_tracks", _swapping_insert_tracks(swap=True))
+
+    drive = _stick(tmp_path)
+
+    with pytest.raises(FatalError) as exc:
+        build_library(
+            _two_track_lib(drive),
+            drive_root=drive,
+            report=ConversionReport(),
+            with_artwork=False,
+        )
+
+    msg = str(exc.value)
+    assert "playlist-scoped recheck" in msg, msg
+    # The intent gate is what did NOT fire: its message names intended entries.
+    assert "intended" not in msg, msg
+
+
+def test_failed_recheck_leaves_the_previous_database_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused build must not disturb the m.db the DJ already has.
+
+    WHY: the check runs before os.replace precisely so failure is survivable. A
+    gate that detected the fault after publishing would only be able to
+    apologise, with the previous library already gone.
+    """
+    import rb2engine.writer.tracks as tracks_mod
+    from rb2engine.writer.build import build_library
+
+    _install_database_fakes(monkeypatch)
+    _install_pipeline_fakes(monkeypatch)
+    monkeypatch.setattr(
+        tracks_mod, "insert_tracks", _swapping_insert_tracks(swap=False)
+    )
+
+    drive = _stick(tmp_path)
+    lib = _two_track_lib(drive)
+
+    m_db = build_library(
+        lib, drive_root=drive, report=ConversionReport(), with_artwork=False
+    )
+    before = m_db.read_bytes()
+    assert before
+
+    # Second conversion of the same library, now with a corrupted mapping.
+    monkeypatch.setattr(
+        tracks_mod, "insert_tracks", _swapping_insert_tracks(swap=True)
+    )
+    with pytest.raises(FatalError):
+        build_library(
+            lib, drive_root=drive, report=ConversionReport(), with_artwork=False
+        )
+
+    assert m_db.read_bytes() == before, "published database was modified by a refused build"
+    assert not Path(str(m_db) + ".tmp").exists()
