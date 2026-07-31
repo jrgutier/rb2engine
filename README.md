@@ -1,5 +1,8 @@
 # rb2engine
 
+[![PyPI](https://img.shields.io/pypi/v/rb2engine)](https://pypi.org/project/rb2engine/)
+[![Downloads](https://static.pepy.tech/badge/rb2engine)](https://pepy.tech/project/rb2engine)
+
 Convert a **rekordbox** USB export into an **Engine DJ** library — on the same stick, in place, without duplicating a single audio file.
 
 Plug the result into Denon/Engine OS gear and your tracks, playlists, beatgrids, hot cues, loops and artwork are there. The Pioneer side keeps working exactly as before, because nothing on it is touched.
