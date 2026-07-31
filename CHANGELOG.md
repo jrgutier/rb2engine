@@ -5,7 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-07-31
+
+Verified end-to-end on a real 3,673-track stick before release: `convert` exit 0
+(3,673/3,673 tracks, 45/45 playlists, 0 skipped) followed by `verify` reporting
+0 discrepancies. That is the same drive and the same `export.pdb` that produced
+the phantom playlist entries this release exists to prevent.
 
 ### Added
 - **`convert` now refuses to publish a database that disagrees with its own

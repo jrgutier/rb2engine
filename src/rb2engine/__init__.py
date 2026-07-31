@@ -1,3 +1,3 @@
 """rb2engine — convert rekordbox USB exports to Engine DJ libraries."""
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
