@@ -213,18 +213,50 @@ def _is_data_page(page_flags: int) -> bool:
     return (page_flags & 0x40) == 0
 
 
+# num_rows is 11 bits; a page holding more present rows than that cannot state
+# its own count, so the cross-check below is skipped rather than mis-fired.
+_NUM_ROWS_MAX = 0x7FF
+
+
 def _iter_present_row_bases(
-    page: bytes, len_page: int, num_row_offsets: int
+    page: bytes,
+    len_page: int,
+    num_row_offsets: int,
+    num_rows: int = -1,
+    page_index: int = -1,
 ) -> list[int]:
-    """Absolute offsets within `page` of each *present* row body."""
+    """Absolute offsets within `page` of each *present* row body.
+
+    G1d — torn/mid-export page images. The row index grows backward from the
+    end of the page, so a row body lives strictly between the page header and
+    the index. Two structural facts are checked here rather than assumed:
+
+    * every present offset points into that heap region, and
+    * the number of present bits equals the ``num_rows`` the header declares.
+
+    Both hold on all 997 data pages of a real 3,673-track export. The second
+    exists because a conversion once published playlist entries the settled
+    ``export.pdb`` does not contain: a stale slot read as present parses
+    cleanly, lands in a coherent chain, and is indistinguishable downstream
+    from a real entry. The page header already carries the count that
+    contradicts it; the walker simply discarded it.
+    """
     if num_row_offsets <= 0:
         return []
     num_groups = (num_row_offsets - 1) // 16 + 1
+    index_bytes = num_groups * ROW_GROUP_SIZE
+    heap_end = len_page - index_bytes
+    if heap_end <= PAGE_HEADER_SIZE:
+        raise UnsupportedFormatError(
+            f"export.pdb page {page_index}: num_row_offsets={num_row_offsets} "
+            f"needs {index_bytes} bytes of row index, which does not fit in a "
+            f"{len_page}-byte page"
+        )
+
     bases: list[int] = []
+    present_count = 0
     for g in range(num_groups):
         group_base = len_page - (g * ROW_GROUP_SIZE)
-        if group_base - 4 < PAGE_HEADER_SIZE:
-            break
         present_flags = struct.unpack_from("<H", page, group_base - 4)[0]
         for r in range(16):
             abs_i = g * 16 + r
@@ -232,13 +264,24 @@ def _iter_present_row_bases(
                 break
             if (present_flags >> r) & 1 == 0:
                 continue  # deleted / absent — honour the bitmask
-            ofs_pos = group_base - (6 + 2 * r)
-            if ofs_pos < 0:
-                continue
-            ofs_row = struct.unpack_from("<H", page, ofs_pos)[0]
+            present_count += 1
+            ofs_row = struct.unpack_from("<H", page, group_base - (6 + 2 * r))[0]
             row_base = ofs_row + PAGE_HEADER_SIZE
-            if 0 <= row_base < len_page:
-                bases.append(row_base)
+            if not (PAGE_HEADER_SIZE <= row_base < heap_end):
+                raise UnsupportedFormatError(
+                    f"export.pdb page {page_index}: row offset {row_base} "
+                    f"(slot {abs_i}) falls outside the row heap "
+                    f"[{PAGE_HEADER_SIZE}, {heap_end}) — the page image is "
+                    f"inconsistent, likely read while being written"
+                )
+            bases.append(row_base)
+
+    if 0 <= num_rows <= _NUM_ROWS_MAX and present_count != num_rows:
+        raise UnsupportedFormatError(
+            f"export.pdb page {page_index}: {present_count} rows marked present "
+            f"but the page header declares num_rows={num_rows} — the page image "
+            f"is inconsistent, likely read while being written"
+        )
     return bases
 
 
@@ -274,14 +317,16 @@ def _walk_table_pages(
 
         next_page = int(lead.next_page)
         page_type = int(lead.page_type)
-        num_row_offsets, _num_rows, page_flags = _decode_page_counts(page)
+        num_row_offsets, num_rows, page_flags = _decode_page_counts(page)
 
         # Stop if we landed on a different table type (safety).
         if page_type != expected_type and idx != first_page:
             break
 
         if _is_data_page(page_flags) and page_type == expected_type:
-            bases = _iter_present_row_bases(page, len_page, num_row_offsets)
+            bases = _iter_present_row_bases(
+                page, len_page, num_row_offsets, num_rows, idx
+            )
             out.append((page, bases))
 
         if idx == last_page:

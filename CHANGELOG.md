@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **G1d — refuse a torn `export.pdb` instead of converting it.** A conversion on
+  a real stick published two playlist entries that the settled `export.pdb` does
+  not contain. Forensics on the drive established what happened: rekordbox last
+  wrote the pdb at 12:09:38 UTC, `convert` started 14 seconds later at 12:09:52,
+  and the file has not been modified since — so `convert` and the `verify` that
+  caught it read the *same* file, and the difference arose while reading a pdb
+  that was still settling. A stale slot read as present parses cleanly, lands in
+  a coherent chain, and is indistinguishable downstream from a real entry.
+
+  The page header already carries the contradiction: it declares `num_rows`, and
+  the reader decoded that field and threw it away. The parser now checks that the
+  present-bit count matches `num_rows`, and that every row offset points into the
+  heap between the page header and the backward-growing row index. Both invariants
+  hold on all 997 data pages of a real 3,673-track export, and ordinary deleted
+  slots — 104 of them in that same file — still parse normally.
+
+  Scope, stated plainly: this catches the demonstrated signature class. A torn
+  image whose header was written before the pages it describes satisfies both
+  checks and would still pass.
 - `verify` paired each source playlist with the wrong Engine list in three ways,
   every one of which invents discrepancies on a correct conversion — the failure
   mode that trains you to ignore verify. Same-named playlists in different
