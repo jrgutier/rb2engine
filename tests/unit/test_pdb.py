@@ -1109,3 +1109,135 @@ def test_real_export_pdb_scale_and_sanity(tmp_path: Path) -> None:
         f"\nreal_stick: tracks={len(lib.tracks)} playlists={len(lib.playlists)} "
         f"elapsed={elapsed:.3f}s sample={sample.title!r} path={sample.resolved_path}"
     )
+
+
+# ---------------------------------------------------------------------------
+# G1d — torn/mid-export page images
+#
+# A real conversion published two playlist entries that the settled export.pdb
+# does not contain (tracks 444 and 2984, 2026-07-29). The file was unchanged
+# between that convert and the verify that caught it, so the difference arose
+# at read time: convert started 14 s after rekordbox's last write to the pdb.
+# A page whose present-bit set disagrees with its declared num_rows is the
+# signature that resurrects a stale row, and the reader decoded num_rows and
+# then discarded it. These tests pin the gate.
+# ---------------------------------------------------------------------------
+
+
+def _resurrect_slot(
+    page: bytes, len_page: int, slot: int, heap_offset: int
+) -> bytes:
+    """Set slot's present bit and point it at a row body, leaving num_rows alone.
+
+    This is what a torn page image looks like to the walker: one more row
+    reachable than the page header says it holds.
+    """
+    buf = bytearray(page)
+    g, r = divmod(slot, 16)
+    group_base = len_page - (g * 0x24)
+    present = struct.unpack_from("<H", buf, group_base - 4)[0]
+    present |= 1 << r
+    struct.pack_into("<H", buf, group_base - 4, present)
+    struct.pack_into("<H", buf, group_base - (6 + 2 * r), heap_offset)
+    return bytes(buf)
+
+
+def _torn_pdb(tmp_path: Path, entry_page: bytes, len_page: int) -> Path:
+    pages = {
+        0: _file_header(
+            len_page=len_page,
+            tables=[(0, 1, 1), (7, 2, 2), (8, 3, 3)],
+        ),
+        1: _build_nondata_page(
+            len_page=len_page, page_index=1, page_type=0, next_page=99
+        ),
+        2: _build_data_page(
+            len_page=len_page,
+            page_index=2,
+            page_type=7,
+            next_page=99,
+            row_blobs=[
+                _playlist_tree_row(
+                    parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="Set A"
+                )
+            ],
+        ),
+        3: entry_page,
+    }
+    path = tmp_path / "torn.pdb"
+    _write_pdb(path, len_page, pages)
+    return path
+
+
+def test_g1d_resurrected_row_beyond_num_rows_raises(tmp_path: Path) -> None:
+    """A present bit the page header does not account for must be refused.
+
+    WHY: this is the observed failure. The stale entry parses cleanly and lands
+    in a coherent chain, so nothing downstream can tell it from a real one —
+    the conversion exits 0 and publishes a library with a track the DJ removed.
+    Refusing the parse is the only point where the two disagree.
+    """
+    len_page = 512
+    rows: list[bytes | None] = [
+        _playlist_entry_row(0, track_id=10, playlist_id=1),
+        None,  # deleted slot — its bytes are still in the heap
+        _playlist_entry_row(1, track_id=20, playlist_id=1),
+    ]
+    page = _build_data_page(
+        len_page=len_page, page_index=3, page_type=8, next_page=99, row_blobs=rows
+    )
+    # Resurrect slot 1, pointing it at the first row body. num_rows still says 2.
+    torn = _resurrect_slot(page, len_page, slot=1, heap_offset=0)
+    path = _torn_pdb(tmp_path, torn, len_page)
+
+    with pytest.raises(UnsupportedFormatError) as exc:
+        parse_export_pdb(path, tmp_path)
+    assert "num_rows" in str(exc.value) or "present" in str(exc.value)
+
+
+def test_g1d_row_offset_inside_row_index_raises(tmp_path: Path) -> None:
+    """A row offset pointing into the backward-growing index is not a row.
+
+    WHY: across 997 pages of a real 3,673-track export every present row body
+    sits between the page header and the index; nothing legitimate points into
+    the index area. The reader only bounded offsets by the page size, so stale
+    index bytes could be parsed as a row.
+    """
+    len_page = 512
+    rows: list[bytes | None] = [
+        _playlist_entry_row(0, track_id=10, playlist_id=1),
+        _playlist_entry_row(1, track_id=20, playlist_id=1),
+    ]
+    page = _build_data_page(
+        len_page=len_page, page_index=3, page_type=8, next_page=99, row_blobs=rows
+    )
+    buf = bytearray(page)
+    # Point slot 0 into the row-index region (heap-relative → absolute ≥ heap end).
+    struct.pack_into("<H", buf, len_page - 6, len_page - PAGE_HEADER)
+    path = _torn_pdb(tmp_path, bytes(buf), len_page)
+
+    with pytest.raises(UnsupportedFormatError) as exc:
+        parse_export_pdb(path, tmp_path)
+    assert "row offset" in str(exc.value).lower()
+
+
+def test_g1d_well_formed_page_with_deleted_rows_still_parses(tmp_path: Path) -> None:
+    """The gate must not fire on ordinary deleted slots.
+
+    WHY: tombstones are normal — a real export carried 104 of them. A gate that
+    rejected those would refuse every library the tool exists to convert.
+    """
+    len_page = 512
+    rows: list[bytes | None] = [
+        _playlist_entry_row(0, track_id=10, playlist_id=1),
+        None,
+        _playlist_entry_row(1, track_id=20, playlist_id=1),
+    ]
+    page = _build_data_page(
+        len_page=len_page, page_index=3, page_type=8, next_page=99, row_blobs=rows
+    )
+    path = _torn_pdb(tmp_path, page, len_page)
+
+    lib = parse_export_pdb(path, tmp_path)
+
+    assert lib.playlists[0].track_rb_ids == [10, 20]
