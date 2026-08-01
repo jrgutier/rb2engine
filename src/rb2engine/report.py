@@ -14,11 +14,24 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 REPORT_FILENAME = "rb2engine-report.json"
 ENGINE_LIBRARY_DIRNAME = "Engine Library"
+
+# Append-only provenance journal, beside the report under Engine Library/.
+# The report is overwritten by every convert — and "re-run convert" is exactly
+# the remedy verify prescribes on a staleness finding, so a fixed-name report
+# alone would destroy the fingerprint of the suspect bytes at the very moment
+# it matters (this already happened once; the incident evidence is gone).
+# One JSONL line per publish survives any number of re-runs.
+JOURNAL_FILENAME = "rb2engine-journal.jsonl"
+
+# Cap so the journal cannot grow without bound on the user's stick. Oldest
+# lines are dropped at publish; ~200 bytes/line leaves room for ~300 publishes.
+JOURNAL_MAX_BYTES = 64 * 1024
 
 # JSON Schema for the conversion report contract (also the source of
 # tests/fixtures/report.schema.json once the lead copies it there).
@@ -125,8 +138,52 @@ REPORT_SCHEMA: dict[str, Any] = {
         "path_base": {"type": ["string", "null"]},
         "fatal": {"type": "boolean"},
         "fatal_message": {"type": ["string", "null"]},
+        # Optional (not in "required"): reports from < 0.5 have no provenance,
+        # and they must keep validating — verify degrades that to a finding.
+        "provenance": {
+            "type": ["object", "null"],
+            "required": [
+                "pdb_sha256",
+                "pdb_size",
+                "pdb_mtime",
+                "m_db_sha256",
+                "max_playlist_id",
+                "max_playlist_entity_id",
+            ],
+            "properties": {
+                "pdb_sha256": {"type": "string", "minLength": 1},
+                "pdb_size": {"type": "integer", "minimum": 0},
+                "pdb_mtime": {"type": "number"},
+                "m_db_sha256": {"type": "string", "minLength": 1},
+                "max_playlist_id": {"type": "integer", "minimum": 0},
+                "max_playlist_entity_id": {"type": "integer", "minimum": 0},
+            },
+            "additionalProperties": True,
+        },
     },
 }
+
+
+@dataclass
+class ProvenanceRecord:
+    """What this publish was built from, and what it produced.
+
+    Captured by the writer at publish time (evidence at write time beats
+    forensics after the fact) but deliberately time-free: build_library must
+    stay deterministic, so the wall-clock timestamp is added only where the
+    journal line is written — in this module, outside the writer/mapper
+    determinism boundary that test_no_wallclock.py enforces.
+
+    The watermarks are the writer's dense 1..N id allocation ceilings; a later
+    row above them was not written by us (external-edit classification, W3).
+    """
+
+    pdb_sha256: str
+    pdb_size: int
+    pdb_mtime: float
+    m_db_sha256: str  # staged m.db, hashed before it crossed to the stick
+    max_playlist_id: int
+    max_playlist_entity_id: int
 
 
 @dataclass
@@ -185,6 +242,9 @@ class ConversionReport:
     path_base: str | None = None
     fatal: bool = False
     fatal_message: str | None = None
+    # Set by build_library on a successful publish (None when the source had no
+    # fingerprint, e.g. libraries not parsed from a pdb, or on fatal runs).
+    provenance: ProvenanceRecord | None = None
 
     def add_skip(
         self,
@@ -262,6 +322,9 @@ class ConversionReport:
             "path_base": self.path_base,
             "fatal": self.fatal,
             "fatal_message": self.fatal_message,
+            "provenance": (
+                None if self.provenance is None else asdict(self.provenance)
+            ),
         }
 
     def write_json(self, path: Path) -> Path:
@@ -369,6 +432,76 @@ def resolve_report_path(
             return eng / REPORT_FILENAME
 
     return Path.cwd() / REPORT_FILENAME
+
+
+def append_journal(
+    engine_lib: Path,
+    record: ProvenanceRecord,
+    *,
+    timestamp: str | None = None,
+) -> Path:
+    """Append one publish line to ``Engine Library/rb2engine-journal.jsonl``.
+
+    Called from the CLI layer after a successful publish — never from writer/,
+    because the line carries a wall-clock timestamp and writer/ is under the
+    no-wallclock determinism gate. The m.db itself stays byte-identical across
+    rebuilds; only this journal varies.
+
+    Capped at JOURNAL_MAX_BYTES by dropping the OLDEST lines: the newest line
+    is the one verify needs, the tail is lineage. The new line is always kept
+    even in the pathological case where it alone exceeds the cap.
+
+    *timestamp* is injectable for tests; production callers omit it.
+    """
+    engine_lib = Path(engine_lib)
+    path = engine_lib / JOURNAL_FILENAME
+    if timestamp is None:
+        timestamp = datetime.now(UTC).isoformat(timespec="seconds")
+    line = (
+        json.dumps(
+            {"timestamp": timestamp, **asdict(record)}, ensure_ascii=False
+        )
+        + "\n"
+    )
+
+    existing = b""
+    if path.exists():
+        existing = path.read_bytes()
+        if existing and not existing.endswith(b"\n"):
+            # A truncated final line (interrupted write) must not be glued to
+            # the front of the new record and corrupt it too.
+            existing += b"\n"
+    content = existing + line.encode("utf-8")
+    if len(content) > JOURNAL_MAX_BYTES:
+        kept = content.split(b"\n")
+        # Drop oldest complete lines until the remainder fits, but never the
+        # line we just appended (kept[-2]; kept[-1] is the trailing empty str).
+        while len(kept) > 2 and len(b"\n".join(kept)) > JOURNAL_MAX_BYTES:
+            kept.pop(0)
+        content = b"\n".join(kept)
+    path.write_bytes(content)
+    return path
+
+
+def read_last_journal_entry(engine_lib: Path) -> dict[str, Any] | None:
+    """Most recent publish record from the journal, or None when absent/empty.
+
+    Raises ValueError on a journal that exists but holds no parseable final
+    line — verify turns that into a visible finding rather than a silent OK.
+    """
+    path = Path(engine_lib) / JOURNAL_FILENAME
+    if not path.is_file():
+        return None
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    try:
+        obj = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"unparseable last line in {path}: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise ValueError(f"last line in {path} is not a JSON object")
+    return obj
 
 
 def validate_report(obj: dict[str, Any], schema: dict[str, Any] | None = None) -> None:

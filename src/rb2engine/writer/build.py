@@ -17,6 +17,7 @@ Safety boundary — this is the ONLY module that writes to the user's stick:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os
 import shutil
@@ -31,7 +32,7 @@ from rb2engine.ir import SourceArtwork, SourceLibrary
 from rb2engine.ir_engine import EngineTrack
 from rb2engine.playlist_check import compare_playlists
 from rb2engine.progress import ProgressCallback, phase_callback
-from rb2engine.report import ConversionReport
+from rb2engine.report import ConversionReport, ProvenanceRecord
 
 logger = logging.getLogger(__name__)
 
@@ -338,8 +339,38 @@ def build_library(
 
         # --- integrity (G4) before swap ----------------------------------------
         _finalize(conn)
+
+        # Watermarks for the provenance record: our id allocation is dense from
+        # 1, so any later row above these ceilings was not written by us.
+        # Queried after _finalize so they describe the database as published.
+        max_playlist_id = int(
+            conn.execute("SELECT COALESCE(MAX(id), 0) FROM Playlist").fetchone()[0]
+        )
+        max_entity_id = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM PlaylistEntity"
+            ).fetchone()[0]
+        )
+
         conn.close()
         conn = None
+
+        # Provenance: pair the fingerprint of the pdb bytes actually parsed
+        # with the hash of the m.db those bytes produced, so a later verify can
+        # name WHICH side moved instead of guessing. Hashed on local storage
+        # before the USB copy. Deliberately no timestamp here — this module is
+        # under the no-wallclock determinism gate; the journal (report.py /
+        # cli.py) adds the clock outside that boundary. The hash lives in the
+        # report/journal, never inside m.db: it cannot hash itself.
+        if lib.fingerprint is not None:
+            report.provenance = ProvenanceRecord(
+                pdb_sha256=lib.fingerprint.sha256,
+                pdb_size=lib.fingerprint.size,
+                pdb_mtime=lib.fingerprint.mtime,
+                m_db_sha256=_sha256_file(stage_path),
+                max_playlist_id=max_playlist_id,
+                max_playlist_entity_id=max_entity_id,
+            )
 
         # journal_mode=DELETE removes m.db.tmp-journal on clean close; assert.
         # Move the finished database onto the target volume as m.db.tmp, then
@@ -437,6 +468,11 @@ def build_library(
                 logger.error("failed to remove partial %s: %s", engine_lib, rm_exc)
 
         msg = f"build_library failed: {exc}"
+        # A fatal run published nothing: a provenance record captured before
+        # the failure (e.g. the pre-publish recheck refused) would describe an
+        # m.db that never reached the stick. Clear it so the report cannot
+        # claim a publish that did not happen.
+        report.provenance = None
         report.mark_fatal(msg)
         if isinstance(exc, FatalError):
             raise
@@ -547,6 +583,12 @@ def _finalize(conn: sqlite3.Connection) -> None:
     fk = conn.execute("PRAGMA foreign_key_check").fetchall()
     if fk:
         raise FatalError(f"PRAGMA foreign_key_check reported {len(fk)} issue(s)")
+
+
+def _sha256_file(path: Path) -> str:
+    """Streamed sha256 — a staged m.db can run to hundreds of MB."""
+    with path.open("rb") as fh:
+        return hashlib.file_digest(fh, "sha256").hexdigest()
 
 
 def _fsync_file(path: Path) -> None:

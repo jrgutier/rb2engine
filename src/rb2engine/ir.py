@@ -101,6 +101,25 @@ class SourceTrack:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceFingerprint:
+    """Identity of the export.pdb bytes a parse actually consumed.
+
+    The sha256 is computed over the in-memory buffer the parser read, never by
+    re-reading the file: a real incident put torn bytes in front of `convert`
+    14 seconds after rekordbox's last write, and the settled file on disk no
+    longer contained what was parsed. Re-reading would fingerprint the wrong
+    thing — the whole point is to name the bytes that produced this library.
+
+    ``size`` is the buffer length (same reasoning); ``mtime`` is corroborating
+    filesystem metadata only, untrustworthy on removable exFAT.
+    """
+
+    sha256: str
+    size: int
+    mtime: float
+
+
+@dataclass(frozen=True, slots=True)
 class SourcePlaylist:
     rb_id: int
     parent_rb_id: int  # 0 = root
@@ -116,6 +135,13 @@ class SourceLibrary:
     tracks: dict[int, SourceTrack]
     playlists: list[SourcePlaylist]
     warnings: list[str]
+    fingerprint: SourceFingerprint | None = None
+    """Reader-owned provenance; None for libraries not parsed from a pdb.
+
+    Defaulted so the many construction sites (tests, filters) stay valid.
+    Deliberately NOT serialized by ``to_json_obj``: that output is load-bearing
+    for golden byte-identity, and a per-source hash would break every golden.
+    """
 
     def to_json_obj(self) -> dict[str, Any]:
         """Canonical JSON structure for `rb2engine inspect --json` / golden_ir.json.
@@ -125,6 +151,8 @@ class SourceLibrary:
         - paths under drive_root → drive-relative POSIX strings
         - paths outside drive_root → \"<external>\" (resolver-bug canary)
         - key order is deterministic (fixed field order, not host-dependent)
+        - ``fingerprint`` is excluded: it varies per source file, so including
+          it would break golden byte-identity on every re-export
         """
         root = self.drive_root.resolve()
         # Track dict keys as strings, sorted by int id for stable map order.
