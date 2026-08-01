@@ -122,6 +122,56 @@ titles were adjusted.
 
 ---
 
+## `verify` reports extra playlists after you opened Engine DJ
+
+**Symptom:** `convert` succeeds and `verify` is clean, then a later `verify`
+reports something like:
+
+```
+track library: playlist_count: expected=45 actual=48
+```
+
+and names playlists that exist in Engine but in no rekordbox playlist.
+
+**Cause:** opening Engine DJ with the drive attached can **merge Engine's own
+desktop library onto the stick**. Those playlists are real and were added by
+Engine on purpose — they are not corruption, and `rb2engine` did not write them.
+`verify` is doing its job: it compares the database against the rekordbox
+source, and after a desktop merge the database legitimately holds more than the
+source describes.
+
+Confirmed by experiment on a 3,673-track library. Identical conversion both
+times; the only variable was Engine's desktop database:
+
+| Engine desktop library | Playlists after opening Engine |
+|---|---|
+| Populated | 48 — three added, playlist ids running past our allocation |
+| Cleared | 45 — none added, no row altered |
+
+**How to tell them apart from a real defect.** `rb2engine` pins `lastEditTime`
+to `1970-01-01 00:00:00` on every playlist row it writes, so anything with a
+real timestamp came from Engine:
+
+```bash
+sqlite3 "/Volumes/MY_USB/Engine Library/Database2/m.db" \
+  "SELECT id, title, lastEditTime FROM Playlist
+    WHERE lastEditTime <> '1970-01-01 00:00:00';"
+```
+
+Rows listed there were written by Engine, not by this tool. A genuine
+conversion defect would carry the pinned epoch.
+
+**Fix:** nothing is broken. **Run `verify` immediately after `convert`, before
+launching Engine DJ** — that is the only moment the database is guaranteed to
+contain exactly what the conversion produced. If you want the stick to match
+rekordbox exactly, re-run `convert`; it rebuilds the database from the source.
+
+Note that Engine also rewrites `m.db` harmlessly on open (the file's timestamp
+and size change by a page or two) even when it merges nothing. A changed
+timestamp alone does not mean your library was modified.
+
+---
+
 ## A track appears once when it was in a playlist twice
 
 **Symptom:** a track that was listed twice in one rekordbox playlist appears

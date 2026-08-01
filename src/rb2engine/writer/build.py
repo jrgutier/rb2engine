@@ -43,6 +43,15 @@ M_DB_TMP_NAME = "m.db.tmp"
 # Determinism pin for columns that Engine DDL triggers stamp with strftime('%s')
 # (Track.lastEditTime on PerformanceData UPDATE) and for opaque Information
 # fields that create_m_db may mint randomly. Fixed epoch 0 — not wall-clock.
+#
+# Leaving currentPlayedIndiciator at 0 is deliberate and costs nothing: Engine
+# DJ populates it itself the first time it opens the library. Measured on a
+# 3,673-track stick by diffing a pristine conversion against the same database
+# after Engine had opened and closed it — that single cell (0 →
+# 1698144667125441751) was the *only* change Engine made. No schema objects, no
+# pragma changes, and Track, PerformanceData, AlbumArt, Playlist and
+# PlaylistEntity all byte-identical. Writing a value here would buy nothing and
+# would forfeit byte-identical rebuilds.
 _DETERMINISTIC_EPOCH = 0
 _DETERMINISTIC_PLAYED_INDICATOR = 0
 
