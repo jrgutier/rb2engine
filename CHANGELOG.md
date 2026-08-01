@@ -5,6 +5,63 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-08-01
+
+0.4.0 stopped a wrong database from being published. This release answers the
+question that made the original incident take days to diagnose: **when `convert`
+and `verify` disagree, which one is out of date?**
+
+### Added
+- **Every `m.db` now records the bytes it was built from.** `convert` fingerprints
+  `export.pdb` (sha256, size, mtime) as it parses it — hashing the buffer it
+  actually read, not a re-read, so a torn read is fingerprinted *as torn* — and
+  stores that alongside the published database's own hash and its id watermarks.
+
+  `verify` compares provenance first and can now say **which oracle moved**: the
+  source changed, the database changed, both, or neither. The incident that
+  motivated all of this was verify blaming the database when the source had moved.
+- **An append-only journal**, `Engine Library/rb2engine-journal.jsonl`, one line
+  per conversion, capped at 64 KB. The report alone was not enough: "re-run
+  convert" is exactly the remedy verify prescribes for staleness, and it overwrites
+  the fixed-name report — destroying the evidence for the next incident the same
+  way it was destroyed for the last one.
+- **Engine DJ's own playlists are named as such.** Opening Engine DJ with a
+  populated desktop library merges its playlists onto the stick. verify previously
+  reported that identically to corruption. It is now reported as an informational
+  **external edit**, naming each playlist, and does not fail verification.
+
+  The discriminator is `lastEditTime`: rb2engine pins every playlist row it writes
+  to the epoch, so any other value came from Engine. That survives Engine
+  reassigning ids — measured on a real stick, ids ran to 84 against our contiguous
+  1–45, which is why the id watermark alone is not usable.
+
+### Changed
+- **`verify` gained exit code 3, "not attributable".** When the recorded
+  fingerprint does not match the source present now, source-dependent comparisons
+  have no oracle and become informational.
+
+  Source-*independent* findings — a broken `nextEntityId` chain, an undecodable
+  blob — still force **exit 1** even under a mismatch. A stale source must never
+  launder a real fault into "just re-run convert". Scripts that treat any non-zero
+  exit as failure are unaffected; scripts that distinguish 1 from other codes
+  should be updated.
+- **A conversion whose report cannot reach the stick now says so loudly.** This
+  was found the hard way: a convert reported success with its drive unmounted and
+  quietly wrote its report into the user's source directory.
+
+### Fixed
+- Documented, after measuring on a 3,673-track library, that the reader's 13-bit
+  page row count is **correct** and must not be "fixed" to the crate-digger shape.
+  14 of 997 pages carry 284 rows and parse correctly; the byte at +24 is merely
+  `284 & 0xFF`, and the u16 at +34 is not a row count at all. Implementing the
+  spec as written would have broken a working parser on exactly the large
+  libraries this tool exists for.
+
+### Notes
+- A stick converted before 0.5.0 has no provenance record. verify reports that
+  visibly but **does not** fail for it — an existing clean library still exits 0.
+  Re-run `convert` to start recording.
+
 ## [0.4.0] - 2026-07-31
 
 Verified end-to-end on a real 3,673-track stick before release: `convert` exit 0
