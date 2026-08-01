@@ -21,7 +21,8 @@ from rb2engine.errors import FatalError
 from rb2engine.ir import SourceFingerprint, SourceLibrary, SourceTrack
 from rb2engine.ir_engine import artwork_content_hash
 from rb2engine.mapper.track import map_track
-from rb2engine.playlist_check import CHAIN, compare_playlists
+from rb2engine.playlist_check import CHAIN, compare_playlists, db_playlist_paths
+from rb2engine.playlist_naming import format_path, resolve_paths
 from rb2engine.reader.library import read_library
 from rb2engine.report import (
     JOURNAL_FILENAME,
@@ -35,6 +36,7 @@ from rb2engine.writer.blobs import (
     decode_track_data,
 )
 from rb2engine.writer.database import detect_schema
+from rb2engine.writer.playlists import PINNED_LAST_EDIT_TIME
 
 ENGINE_LIBRARY_DIRNAME = "Engine Library"
 DATABASE2_DIRNAME = "Database2"
@@ -77,12 +79,40 @@ class ProvenanceFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ExternalEdit:
+    """A playlist Engine DJ added to the database after our conversion.
+
+    Classified by ``lastEditTime``: the writer pins every playlist row it
+    creates to ``PINNED_LAST_EDIT_TIME``, so a row carrying any other value was
+    not written by rb2engine. Observed on real hardware (2026-07-31): opening
+    Engine DJ with a populated desktop library merged 3 playlists onto a
+    freshly-converted stick, each with a real edit timestamp.
+
+    ``beyond_watermark`` is corroboration only, never the classifier: the same
+    experiment showed Engine *reassigns* Playlist ids across a merge (ids ran
+    to 84 against our contiguous 1..45), so an id above our allocation can also
+    be one of our own rows renumbered.
+    """
+
+    label: str
+    playlist_id: int
+    last_edit_time: str
+    beyond_watermark: bool
+
+
+@dataclass(frozen=True, slots=True)
 class VerifyResult:
     """Outcome of ``verify_library``.
 
     Counts are per-track: a track is mismatched if it contributed ≥1
     discrepancy. Library-level discrepancies (playlist count/order, artwork)
     set ``ok`` False without necessarily inflating track counts.
+
+    ``external_edits`` is informational and deliberately excluded from ``ok``:
+    an Engine desktop-library merge is a legitimate Engine feature, not a
+    conversion defect, so it must not fail verification (CLI exit stays 0).
+    It also stays informational because an Engine in-place migration that
+    rewrote every row's lastEditTime would otherwise mass-report.
     """
 
     checked: int
@@ -90,6 +120,7 @@ class VerifyResult:
     mismatched: int
     discrepancies: list[Discrepancy] = field(default_factory=list)
     provenance_findings: list[ProvenanceFinding] = field(default_factory=list)
+    external_edits: list[ExternalEdit] = field(default_factory=list)
     source_changed: bool = False
     """Recorded pdb fingerprint does not match the source parsed this run."""
     db_changed: bool = False
@@ -162,6 +193,32 @@ class VerifyResult:
                     f"  track {tid}: {d.field}: "
                     f"expected={d.expected!r} actual={d.actual!r}"
                 )
+        if self.external_edits:
+            # Wording kept in step with docs/TROUBLESHOOTING.md ("`verify`
+            # reports extra playlists after you opened Engine DJ") — verify
+            # must tell the same story the docs already do.
+            lines.append("")
+            lines.append("External edits (informational, from Engine DJ):")
+            for e in self.external_edits:
+                extra = (
+                    ", id beyond this conversion's allocation"
+                    if e.beyond_watermark
+                    else ""
+                )
+                lines.append(
+                    f"  playlist {e.label!r} (Playlist.id {e.playlist_id}, "
+                    f"lastEditTime {e.last_edit_time!r}{extra})"
+                )
+            lines.extend(
+                [
+                    "  rb2engine pins lastEditTime to "
+                    f"{PINNED_LAST_EDIT_TIME!r} on every playlist it writes; "
+                    "these rows carry other values, so Engine DJ added them",
+                    "  (typically by merging its desktop library onto the "
+                    "stick). Your conversion is not corrupt. Re-run convert "
+                    "to make the stick match rekordbox exactly.",
+                ]
+            )
         return "\n".join(lines) + "\n"
 
 
@@ -392,6 +449,7 @@ def _verify_against_open_db(
     db_tracks = _load_db_tracks(conn)
     by_path = {t.path: t for t in db_tracks}
     discrepancies: list[Discrepancy] = []
+    external_edits: list[ExternalEdit] = []
 
     rb_ids = sorted(source.tracks.keys())
     if sample is not None:
@@ -426,6 +484,7 @@ def _verify_against_open_db(
         drive_root=drive_root,
         engine_lib=engine_lib,
         discrepancies=discrepancies,
+        external_edits=external_edits,
     )
 
     if with_artwork:
@@ -436,6 +495,7 @@ def _verify_against_open_db(
         matched=matched,
         mismatched=mismatched,
         discrepancies=discrepancies,
+        external_edits=external_edits,
     )
 
 
@@ -754,16 +814,55 @@ def _compare_playlists(
     drive_root: Path,
     engine_lib: Path,
     discrepancies: list[Discrepancy],
+    external_edits: list[ExternalEdit],
 ) -> None:
-    db_count = conn.execute("SELECT COUNT(*) FROM Playlist").fetchone()[0]
+    db_count = int(conn.execute("SELECT COUNT(*) FROM Playlist").fetchone()[0])
     exp_count = len(source.playlists)
-    if int(db_count) != exp_count:
+
+    # Classify database playlists the source does not describe. The writer pins
+    # lastEditTime on every row it creates, so an extra playlist carrying any
+    # other value was written by Engine DJ — a legitimate desktop-library merge
+    # observed on real hardware (2026-07-31: 45 converted playlists became 48
+    # after opening Engine DJ; the 3 additions all carried real timestamps).
+    # Reporting that the same way as corruption would train users to ignore
+    # verify. An extra playlist that DOES carry our pin, by contrast, claims to
+    # be ours and is not — that stays a real discrepancy below.
+    #
+    # Deliberately NOT keyed on Playlist.id versus our contiguous allocation:
+    # the same experiment showed Engine reassigns ids across a merge (ids ran
+    # to 84 against our 1..45), so id position alone would misclassify our own
+    # renumbered rows. max(Playlist.id) serves only as corroborating detail.
+    expected_paths = set(resolve_paths(source.playlists).values())
+    last_edit_of = {
+        int(row[0]): "" if row[1] is None else str(row[1])
+        for row in conn.execute("SELECT id, lastEditTime FROM Playlist")
+    }
+    for path, list_id in sorted(
+        db_playlist_paths(conn).items(), key=lambda item: item[1]
+    ):
+        if path in expected_paths:
+            continue
+        last_edit = last_edit_of[list_id]
+        if last_edit != PINNED_LAST_EDIT_TIME:
+            external_edits.append(
+                ExternalEdit(
+                    label=format_path(path),
+                    playlist_id=list_id,
+                    last_edit_time=last_edit,
+                    beyond_watermark=list_id > exp_count,
+                )
+            )
+
+    # Count only rows this tool could have written: Engine's additions are
+    # already named above as informational external edits, and re-counting
+    # them here would push the exit code to 1 for a benign Engine feature.
+    if db_count - len(external_edits) != exp_count:
         discrepancies.append(
             Discrepancy(
                 track_id=None,
                 field="playlist_count",
                 expected=exp_count,
-                actual=int(db_count),
+                actual=db_count - len(external_edits),
             )
         )
 
