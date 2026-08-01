@@ -9,17 +9,25 @@ corrupt m.db to prove each check fires.
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from rb2engine.errors import FatalError
-from rb2engine.ir import SourceLibrary, SourceTrack
+from rb2engine.ir import SourceFingerprint, SourceLibrary, SourceTrack
 from rb2engine.ir_engine import artwork_content_hash
 from rb2engine.mapper.track import map_track
-from rb2engine.playlist_check import compare_playlists
+from rb2engine.playlist_check import CHAIN, compare_playlists
 from rb2engine.reader.library import read_library
+from rb2engine.report import (
+    JOURNAL_FILENAME,
+    REPORT_FILENAME,
+    read_last_journal_entry,
+)
 from rb2engine.writer.blobs import (
     decode_beat_data,
     decode_loops,
@@ -44,6 +52,28 @@ class Discrepancy:
     field: str
     expected: Any
     actual: Any
+    source_independent: bool = False
+    """True when the finding needs no source oracle to be a defect.
+
+    A broken nextEntityId chain or an undecodable blob is wrong no matter what
+    export.pdb says today, so these findings survive a stale-source
+    (fingerprint-mismatch) situation and keep forcing exit 1. Everything else
+    is a comparison against the parsed source and becomes unattributable when
+    that source is not the one the m.db was built from.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class ProvenanceFinding:
+    """One top-level provenance observation, rendered before discrepancies.
+
+    Separate from Discrepancy on purpose: a stale source is not a corrupt
+    database, and the incident this exists for was verify blaming the wrong
+    oracle. ``code`` is machine-stable; ``message`` carries the remedy.
+    """
+
+    code: str  # "source_changed" | "db_changed" | "provenance_missing" | "journal_unreadable"
+    message: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,10 +89,34 @@ class VerifyResult:
     matched: int
     mismatched: int
     discrepancies: list[Discrepancy] = field(default_factory=list)
+    provenance_findings: list[ProvenanceFinding] = field(default_factory=list)
+    source_changed: bool = False
+    """Recorded pdb fingerprint does not match the source parsed this run."""
+    db_changed: bool = False
+    """m.db bytes differ from the recorded publish (Engine rewrites are legit)."""
+    provenance_missing: bool = False
+    """No usable provenance record (pre-0.5 m.db, or the record never landed)."""
 
     @property
     def ok(self) -> bool:
         return len(self.discrepancies) == 0
+
+    @property
+    def exit_code(self) -> int:
+        """0 ok / 1 discrepancies / 3 not-attributable. (2 = cannot-verify,
+        raised as FatalError before a result exists, so it keeps precedence.)
+
+        Partition: source-INDEPENDENT findings (chain breaks, undecodable
+        blobs) are defects regardless of which export.pdb is present, so they
+        always win — a stale source must never launder a real fault into
+        "re-run convert". Source-DEPENDENT comparisons under a fingerprint
+        mismatch have no oracle and become informational (exit 3).
+        """
+        if any(d.source_independent for d in self.discrepancies):
+            return 1
+        if self.source_changed:
+            return 3
+        return 1 if self.discrepancies else 0
 
     def render_text(self) -> str:
         """Human-readable summary for the ``verify`` command.
@@ -72,7 +126,13 @@ class VerifyResult:
         refuses rather than reports; a full field-level verify stays an explicit
         second step.
         """
-        status = "OK" if self.ok else "FAILED"
+        code = self.exit_code
+        if code == 0:
+            status = "OK"
+        elif code == 3:
+            status = "NOT ATTRIBUTABLE (re-run convert)"
+        else:
+            status = "FAILED"
         lines = [
             "rb2engine verify",
             "---------------",
@@ -82,9 +142,20 @@ class VerifyResult:
             f"Mismatched:  {self.mismatched}",
             f"Discrepancies: {len(self.discrepancies)}",
         ]
+        if self.provenance_findings:
+            lines.append("")
+            lines.append("Provenance:")
+            for p in self.provenance_findings:
+                lines.append(f"  [{p.code}] {p.message}")
         if self.discrepancies:
             lines.append("")
             lines.append("Discrepancies:")
+            if code == 3:
+                lines.append(
+                    "  (informational — the source is not the one this m.db "
+                    "was built from, so the comparisons below are not "
+                    "attributable to either side; re-run convert)"
+                )
             for d in self.discrepancies:
                 tid = "library" if d.track_id is None else str(d.track_id)
                 lines.append(
@@ -132,9 +203,14 @@ def verify_library(
     source = read_library(drive_root, with_anlz=True, with_artwork=with_artwork)
     engine_lib = drive_root / ENGINE_LIBRARY_DIRNAME
 
+    # Hash the m.db BEFORE decoding it: this is the "which oracle moved"
+    # question, and it must be answered against the same bytes we then verify.
+    with m_db_path.open("rb") as fh:
+        m_db_sha256 = hashlib.file_digest(fh, "sha256").hexdigest()
+
     conn = sqlite3.connect(f"file:{m_db_path.resolve()}?mode=ro", uri=True)
     try:
-        return _verify_against_open_db(
+        result = _verify_against_open_db(
             source,
             conn,
             drive_root=drive_root,
@@ -145,10 +221,146 @@ def verify_library(
     finally:
         conn.close()
 
+    findings, source_changed, db_changed, missing = _assess_provenance(
+        engine_lib,
+        source_fingerprint=source.fingerprint,
+        m_db_sha256=m_db_sha256,
+    )
+    return dataclasses.replace(
+        result,
+        provenance_findings=findings,
+        source_changed=source_changed,
+        db_changed=db_changed,
+        provenance_missing=missing,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+# Wording shared by every not-attributable path. The residue is irreducible:
+# when the source has moved, source-dependent corruption in the m.db is
+# indistinguishable in principle from the source change itself until convert
+# re-runs and re-pairs the oracles.
+_RESIDUE = (
+    "Source-dependent comparisons are not attributable while the source and "
+    "database are unpaired; corruption co-occurring with a changed source is "
+    "undetectable until convert re-runs."
+)
+
+
+def _load_recorded_provenance(
+    engine_lib: Path,
+) -> tuple[dict[str, Any] | None, list[ProvenanceFinding]]:
+    """Last recorded publish, from the journal (authority) else the report.
+
+    Never raises: a stick we cannot read provenance from must degrade to a
+    visible finding, not a crash — a 0.4.0 m.db has no record at all.
+    """
+    findings: list[ProvenanceFinding] = []
+    try:
+        entry = read_last_journal_entry(engine_lib)
+    except (OSError, ValueError) as exc:
+        findings.append(
+            ProvenanceFinding(
+                "journal_unreadable",
+                f"provenance journal exists but is unreadable ({exc}); "
+                "falling back to the report",
+            )
+        )
+        entry = None
+    if entry is not None and isinstance(entry.get("pdb_sha256"), str):
+        return entry, findings
+
+    # Fallback witness: the report JSON's provenance block (same publish, but
+    # overwritten by every convert — the journal exists precisely because
+    # "re-run convert" is the prescribed remedy and would shred it).
+    report_path = engine_lib / REPORT_FILENAME
+    if report_path.is_file():
+        try:
+            obj = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            obj = None
+        if isinstance(obj, dict):
+            prov = obj.get("provenance")
+            if isinstance(prov, dict) and isinstance(prov.get("pdb_sha256"), str):
+                return prov, findings
+    return None, findings
+
+
+def _assess_provenance(
+    engine_lib: Path,
+    *,
+    source_fingerprint: SourceFingerprint | None,
+    m_db_sha256: str,
+) -> tuple[list[ProvenanceFinding], bool, bool, bool]:
+    """Compare the recorded publish against what this run can see.
+
+    Returns ``(findings, source_changed, db_changed, provenance_missing)`` —
+    the attribution matrix: which oracle moved, or that we cannot know.
+    """
+    recorded, findings = _load_recorded_provenance(engine_lib)
+
+    if recorded is None:
+        findings.append(
+            ProvenanceFinding(
+                "provenance_missing",
+                "no provenance record on this stick (no "
+                f"{JOURNAL_FILENAME} and no provenance in {REPORT_FILENAME}): "
+                "the m.db predates provenance tracking or the record was "
+                "written off-stick. Discrepancies below, if any, cannot be "
+                "attributed to source vs database; re-run convert to record "
+                "provenance.",
+            )
+        )
+        return findings, False, False, True
+
+    source_changed = False
+    if source_fingerprint is None:
+        # Only reachable when the source parse carried no fingerprint (test
+        # doubles / non-pdb libraries) — without it the recorded hash has
+        # nothing to be compared against, which is the missing case.
+        findings.append(
+            ProvenanceFinding(
+                "provenance_missing",
+                "the parsed source carries no fingerprint, so the recorded "
+                "publish cannot be compared against it.",
+            )
+        )
+        return findings, False, False, True
+
+    if recorded["pdb_sha256"] != source_fingerprint.sha256:
+        source_changed = True
+        findings.append(
+            ProvenanceFinding(
+                "source_changed",
+                "m.db was built from a different export.pdb than the one on "
+                f"this stick (recorded sha256 {recorded['pdb_sha256'][:12]}…, "
+                f"current {source_fingerprint.sha256[:12]}…). This is a stale "
+                "or re-exported source, not database corruption; re-run "
+                f"convert. {_RESIDUE}",
+            )
+        )
+
+    db_changed = False
+    recorded_db = recorded.get("m_db_sha256")
+    if isinstance(recorded_db, str) and recorded_db != m_db_sha256:
+        db_changed = True
+        findings.append(
+            ProvenanceFinding(
+                "db_changed",
+                "m.db has changed since rb2engine published it (recorded "
+                f"sha256 {recorded_db[:12]}…, current {m_db_sha256[:12]}…). "
+                "Expected when Engine DJ has opened this drive — it rewrites "
+                "and merges its desktop library into m.db. The source "
+                "comparison below remains authoritative for what the m.db "
+                "holds now.",
+            )
+        )
+
+    return findings, source_changed, db_changed, False
 
 
 @dataclass
@@ -333,6 +545,9 @@ def _compare_track_data_blob(
                 field="track_data",
                 expected="decodable",
                 actual=f"decode_error: {exc}",
+                # An undecodable blob is a defect no matter what the source
+                # says today — it survives the exit-3 staleness partition.
+                source_independent=True,
             )
         )
         return
@@ -363,6 +578,9 @@ def _compare_beatgrid(
                 field="beat_data",
                 expected="decodable",
                 actual=f"decode_error: {exc}",
+                # An undecodable blob is a defect no matter what the source
+                # says today — it survives the exit-3 staleness partition.
+                source_independent=True,
             )
         )
         return
@@ -399,6 +617,9 @@ def _compare_quick_cues(
                 field="quick_cues",
                 expected="decodable",
                 actual=f"decode_error: {exc}",
+                # An undecodable blob is a defect no matter what the source
+                # says today — it survives the exit-3 staleness partition.
+                source_independent=True,
             )
         )
         return
@@ -482,6 +703,9 @@ def _compare_loops(
                 field="loops",
                 expected="decodable",
                 actual=f"decode_error: {exc}",
+                # An undecodable blob is a defect no matter what the source
+                # says today — it survives the exit-3 staleness partition.
+                source_independent=True,
             )
         )
         return
@@ -559,6 +783,11 @@ def _compare_playlists(
                 field=f"playlist[{problem.label}].{problem.kind}",
                 expected=problem.expected,
                 actual=problem.actual,
+                # A broken nextEntityId chain is internally inconsistent — no
+                # source oracle is needed to call it a defect, so it must beat
+                # a staleness (exit 3) classification. Membership/order kinds
+                # stay source-dependent.
+                source_independent=(problem.kind == CHAIN),
             )
         )
 

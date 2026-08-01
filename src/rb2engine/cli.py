@@ -77,6 +77,8 @@ def _filter_library_track(library: Any, track_id: int) -> Any:
         tracks={track_id: library.tracks[track_id]},
         playlists=list(library.playlists),
         warnings=list(library.warnings),
+        # getattr: test doubles for this loader predate the provenance field.
+        fingerprint=getattr(library, "fingerprint", None),
     )
 
 
@@ -201,6 +203,25 @@ def _emit_report(
         click.echo(f"report: {written}")
     except OSError as exc:
         click.echo(f"warning: could not write JSON report: {exc}", err=True)
+        return
+
+    # The cwd fallback is right for fatal/early failures, but on a SUCCESSFUL
+    # run it means the stick carries no record of what it was built from. This
+    # really happened: a convert reported success with its drive already
+    # unmounted and quietly dropped the report into the source repo. Say so.
+    if (
+        drive is not None
+        and override is None
+        and not report.fatal
+        and not written.resolve().is_relative_to(Path(drive).resolve())
+    ):
+        click.echo(
+            f"warning: the report landed at {written}, NOT on the stick — "
+            "the drive's Engine Library was missing or unwritable, so no "
+            "provenance record travels with this conversion. Check that the "
+            "drive is still mounted and re-run convert.",
+            err=True,
+        )
 
 
 @main.command("convert")
@@ -325,6 +346,26 @@ def convert_cmd(
         # Also covers ctx.exit() on the dry-run path, which raises internally.
         progress.close()
 
+    # Provenance journal: one appended line per publish, written before the
+    # success banner so a crash cannot yield a published m.db with no record.
+    # Lives here (not in writer/) because the line carries a wall-clock
+    # timestamp and writer/ is under the no-wallclock determinism gate.
+    if report.provenance is not None:
+        from rb2engine.report import ENGINE_LIBRARY_DIRNAME, append_journal
+
+        try:
+            journal = append_journal(
+                Path(drive) / ENGINE_LIBRARY_DIRNAME, report.provenance
+            )
+            click.echo(f"journal: {journal}")
+        except OSError as exc:
+            click.echo(
+                f"warning: m.db was published but the provenance journal "
+                f"could not be written: {exc} — a later verify will report "
+                "missing provenance for this publish.",
+                err=True,
+            )
+
     _emit_report(report, drive, report_path)
     counters = report.counters
     click.echo(
@@ -361,7 +402,11 @@ def verify_cmd(
     are compared at sample granularity.
 
     Read-only. Exit codes: 0 everything matches, 1 discrepancies found,
-    2 could not verify (no library, unreadable, unsupported schema).
+    2 could not verify (no library, unreadable, unsupported schema),
+    3 comparison not attributable — the m.db was built from a different
+    export.pdb than the one on the stick; re-run convert. Real defects
+    (broken chains, undecodable blobs) still exit 1 even then, and 2 keeps
+    precedence over both.
     """
     if drive is None:
         raise click.UsageError("DRIVE is required (the mount point of the stick)")
@@ -378,7 +423,9 @@ def verify_cmd(
         ctx.exit(2)
 
     click.echo(result.render_text())
-    ctx.exit(0 if result.ok else 1)
+    # Partition lives on the result (verify.py) so the CLI cannot re-derive a
+    # different contract from the one render_text just described.
+    ctx.exit(result.exit_code)
 
 
 @main.command("doctor")

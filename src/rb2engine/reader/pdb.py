@@ -13,6 +13,7 @@ G1c  consumed table missing-when-required or present-but-unparseable → Unsuppo
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from enum import IntEnum
 from pathlib import Path, PurePosixPath
@@ -30,7 +31,7 @@ from construct import (  # type: ignore[import-untyped]
 from construct.core import ConstructError
 
 from rb2engine.errors import UnsupportedFormatError
-from rb2engine.ir import SourceLibrary, SourcePlaylist, SourceTrack
+from rb2engine.ir import SourceFingerprint, SourceLibrary, SourcePlaylist, SourceTrack
 from rb2engine.reader.paths import resolve_track_path
 from rb2engine.reader.strings import decode_device_sql_string
 
@@ -592,9 +593,22 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
     path = Path(path)
     drive_root = Path(drive_root)
     try:
+        mtime = path.stat().st_mtime
         data = path.read_bytes()
     except OSError as exc:
         raise UnsupportedFormatError(f"cannot read export.pdb at {path}: {exc}") from exc
+
+    # Provenance: hash the buffer we are about to parse, not the file. A torn
+    # read (observed: convert 14 s after rekordbox's last write on exFAT) means
+    # the file settles into different bytes than the ones parsed here; a later
+    # verify must be able to say WHICH bytes this library came from. Costs no
+    # extra IO. mtime is stat'd before the read so both failure modes land in
+    # the same OSError guard; it is corroborating metadata, never authority.
+    fingerprint = SourceFingerprint(
+        sha256=hashlib.sha256(data).hexdigest(),
+        size=len(data),
+        mtime=mtime,
+    )
 
     header = _parse_file_header(data)
     len_page = int(header.len_page)
@@ -794,4 +808,5 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
         tracks=tracks,
         playlists=playlists,
         warnings=warnings,
+        fingerprint=fingerprint,
     )
