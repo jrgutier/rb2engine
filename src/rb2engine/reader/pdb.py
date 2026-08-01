@@ -200,7 +200,27 @@ def _parse_file_header(data: bytes) -> Any:
 
 
 def _decode_page_counts(page: bytes) -> tuple[int, int, int]:
-    """Return (num_row_offsets, num_rows, page_flags) from the packed u32 at +24."""
+    """Return (num_row_offsets, num_rows, page_flags) from the packed u32 at +24.
+
+    The 13-bit field is the whole slot count, and that is deliberate. crate-digger
+    models these bytes differently — an 8-bit ``num_rows_small`` at +24 with a
+    ``num_rows_large`` u16 at +34 taking over past 255 rows — which would mean this
+    reader mis-parses any dense page. Measured against a real 3,673-track export
+    (997 data pages, 14 of them carrying 284 rows):
+
+    * ``word & 0x1FFF`` = 284 on those pages, and they parse correctly — the
+      library converts to 3,872 playlist entries and verifies with 0 discrepancies.
+    * the byte at +24 is 28, which is just ``284 & 0xFF``; alone it under-reports.
+    * the u16 at +34 is **not** a row count. It reads 283, 84, 14, 20 across pages
+      that all hold 284 rows, and 0x1FFF on 271 others. This repo calls that field
+      ``transaction_row_index``, which fits — 283 is the last index of 284 rows.
+    * on the 983 pages holding <=255 rows, the 13-bit field and the byte agree,
+      which is why the divergence is invisible on small libraries.
+
+    Do not "fix" this to the crate-digger shape without re-running that measurement
+    on a real export; fixtures cannot settle it, since they are packed by the same
+    assumption the parser makes.
+    """
     word = struct.unpack_from("<I", page, 24)[0]
     num_row_offsets = word & 0x1FFF
     num_rows = (word >> 13) & 0x7FF
