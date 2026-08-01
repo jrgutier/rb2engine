@@ -30,7 +30,12 @@ from rb2engine.playlist_naming import resolve_titles
 _NO_NEXT = 0
 
 # Determinism: no wall-clock in writer/. Fixed epoch string for lastEditTime.
-_LAST_EDIT_TIME = "1970-01-01 00:00:00"
+#
+# Public because it doubles as a provenance marker: every playlist row this
+# writer produces carries exactly this value, so a row with any other
+# lastEditTime was written by Engine DJ, not by us. verify's external-edit
+# classifier imports it — the two must never drift apart.
+PINNED_LAST_EDIT_TIME = "1970-01-01 00:00:00"
 
 
 logger = logging.getLogger(__name__)
@@ -178,7 +183,7 @@ def insert_playlists(
                 parent_engine,
                 1,  # isPersisted: export all converted lists as visible
                 next_list_of[eid],
-                _LAST_EDIT_TIME,
+                PINNED_LAST_EDIT_TIME,
                 1,  # isExplicitlyExported
             ),
         )

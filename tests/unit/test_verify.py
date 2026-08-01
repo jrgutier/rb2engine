@@ -1103,6 +1103,205 @@ def test_verify_catches_extra_playlist_count(
     d = _disc(result, "playlist_count")
     assert d.expected == 1
     assert d.actual == 2
+    assert result.external_edits == []
+
+
+# ---------------------------------------------------------------------------
+# External-edit classifier — Engine DJ merging its desktop library is not
+# corruption. Measured 2026-07-31 on real hardware: opening Engine DJ with a
+# populated desktop library turned 45 converted playlists into 48, every
+# addition carrying a real lastEditTime against our pinned epoch, with
+# Playlist ids reassigned up to 84 against our contiguous 1..45.
+# ---------------------------------------------------------------------------
+
+
+def test_verify_classifies_engine_added_playlist_as_external_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extra playlist with a real lastEditTime is informational, not a defect.
+
+    WHY: verify used to report an Engine desktop-library merge with the same
+    playlist_count discrepancy as corruption (expected=45 actual=48 in the
+    field incident). Users who see corruption reports for a legitimate Engine
+    feature stop trusting verify. The pinned-epoch rule attributes the rows.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, "
+        "lastEditTime, isExplicitlyExported) VALUES ('Setlist Bigroom 2', 0, 1, "
+        "0, '2026-07-25 04:04:07', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    # Informational only: verification still passes, exit code unchanged.
+    assert result.ok is True
+    assert "playlist_count" not in _fields(result.discrepancies)
+    assert len(result.external_edits) == 1
+    edit = result.external_edits[0]
+    assert edit.label == "Setlist Bigroom 2"
+    assert edit.last_edit_time == "2026-07-25 04:04:07"
+    assert edit.beyond_watermark is True
+
+    # The rendered output must tell the troubleshooting story: names the
+    # playlist, attributes it to Engine DJ, says the conversion is fine, and
+    # points at re-running convert.
+    text = result.render_text()
+    assert "Setlist Bigroom 2" in text
+    assert "Engine DJ" in text
+    assert "not corrupt" in text
+    assert "Re-run convert" in text
+
+
+def test_verify_external_edit_exit_code_stays_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI verify must exit 0 when the only finding is an Engine-added playlist.
+
+    WHY: exit 1 means "conversion does not match the source, act on it".
+    Scripting around verify (CI, pre-gig checklists) must not go red because
+    Engine DJ synced its own desktop library — that is the benign class the
+    classifier exists to separate.
+    """
+    from click.testing import CliRunner
+
+    from rb2engine.cli import main
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, "
+        "lastEditTime, isExplicitlyExported) VALUES ('Merged', 0, 1, 0, "
+        "'2026-07-30 09:20:00', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = CliRunner().invoke(main, ["verify", str(drive), "--no-artwork"])
+
+    assert result.exit_code == 0, result.output
+    assert "Merged" in result.output
+    assert "Engine DJ" in result.output
+
+
+def test_verify_pinned_epoch_wrong_membership_is_still_a_discrepancy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A playlist carrying OUR epoch with wrong membership stays a hard finding.
+
+    WHY: the classifier separates Engine's additions from defects — it must
+    never launder a genuine wrong write. A row pinned to our epoch claims to be
+    ours, so its membership diverging from the source is exactly the incident
+    class verify exists to catch.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    # Drop Gamma from the playlist with a coherent chain (tail rewired to 0)
+    # and lastEditTime still pinned — a faithful-looking wrong write, the same
+    # shape as the original phantom-entry incident.
+    gamma = _track_row_id(conn, "Gamma")
+    row = conn.execute(
+        "SELECT id FROM PlaylistEntity WHERE trackId = ?", (gamma,)
+    ).fetchone()
+    conn.execute(
+        "UPDATE PlaylistEntity SET nextEntityId = 0 WHERE nextEntityId = ?",
+        (row[0],),
+    )
+    conn.execute("DELETE FROM PlaylistEntity WHERE id = ?", (row[0],))
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.ok is False
+    assert "playlist[Main Set].track_order" in _fields(result.discrepancies)
+    assert result.external_edits == []
+
+
+def test_verify_id_reassignment_with_pinned_epoch_is_not_external(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rows renumbered above the id watermark but carrying our epoch: no report.
+
+    WHY: the id-reassignment trap. Engine provably renumbers Playlist ids when
+    it rewrites m.db (ids ran to 84 against our contiguous 1..45), so an id
+    above our allocation can be one of our own rows moved. Classifying on ids
+    would mass-report the whole library as externally edited after a rewrite
+    that changed nothing logical. Only a foreign lastEditTime attributes a row
+    to Engine.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    # Simulate Engine renumbering every playlist far above our 1..N allocation
+    # while preserving content and our pinned epoch.
+    conn.execute("UPDATE PlaylistEntity SET listId = listId + 100")
+    conn.execute(
+        "UPDATE Playlist SET id = id + 100, "
+        "parentListId = CASE parentListId WHEN 0 THEN 0 "
+        "ELSE parentListId + 100 END, "
+        "nextListId = CASE nextListId WHEN 0 THEN 0 ELSE nextListId + 100 END"
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert result.external_edits == []
+    assert result.ok is True
+
+
+def test_verify_mixed_extra_playlists_split_by_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One Engine-added extra and one pinned-epoch extra must split cleanly.
+
+    WHY: subtracting Engine's additions from the count must not absorb an
+    extra row that claims to be ours — that one still has no source playlist
+    behind it and stays a playlist_count discrepancy.
+    """
+    from rb2engine.verify import verify_library
+
+    drive, lib, m_db = _build_fixture(tmp_path)
+    _patch_read_library(monkeypatch, lib)
+
+    conn = sqlite3.connect(str(m_db))
+    conn.execute(
+        "INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, "
+        "lastEditTime, isExplicitlyExported) VALUES ('From Engine', 0, 1, 0, "
+        "'2026-07-25 04:11:00', 1)"
+    )
+    conn.execute(
+        "INSERT INTO Playlist (title, parentListId, isPersisted, nextListId, "
+        "lastEditTime, isExplicitlyExported) VALUES ('Claims To Be Ours', 0, 1, "
+        "0, '1970-01-01 00:00:00', 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    result = verify_library(drive, with_artwork=False)
+
+    assert [e.label for e in result.external_edits] == ["From Engine"]
+    d = _disc(result, "playlist_count")
+    assert d.expected == 1
+    assert d.actual == 2  # ours + the pinned impostor; Engine's row excluded
+    assert result.ok is False
 
 
 def test_verify_playlist_chain_cycle_does_not_hang(

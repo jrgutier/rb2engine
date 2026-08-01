@@ -125,13 +125,17 @@ titles were adjusted.
 ## `verify` reports extra playlists after you opened Engine DJ
 
 **Symptom:** `convert` succeeds and `verify` is clean, then a later `verify`
-reports something like:
+lists the extra playlists under an informational section:
 
 ```
-track library: playlist_count: expected=45 actual=48
+External edits (informational, from Engine DJ):
+  playlist 'Setlist Bigroom 2' (Playlist.id 47, lastEditTime '2026-07-25 04:04:07')
 ```
 
-and names playlists that exist in Engine but in no rekordbox playlist.
+naming playlists that exist in Engine but in no rekordbox playlist. `verify`
+still exits 0 — this section is attribution, not a defect. (Versions before
+0.4.0 reported the same situation as a bare
+`playlist_count: expected=45 actual=48` discrepancy.)
 
 **Cause:** opening Engine DJ with the drive attached can **merge Engine's own
 desktop library onto the stick**. Those playlists are real and were added by
@@ -150,7 +154,8 @@ times; the only variable was Engine's desktop database:
 
 **How to tell them apart from a real defect.** `rb2engine` pins `lastEditTime`
 to `1970-01-01 00:00:00` on every playlist row it writes, so anything with a
-real timestamp came from Engine:
+real timestamp came from Engine. This is the rule `verify` applies to build the
+informational section above; to check by hand:
 
 ```bash
 sqlite3 "/Volumes/MY_USB/Engine Library/Database2/m.db" \
