@@ -631,12 +631,12 @@ def test_id3_unsynchronisation_deescapes_jpeg(tmp_path: Path) -> None:
     image = _JPEG_1X1
     assert b"\xff" in image  # precondition: unsync will touch this payload
     apic_body = _apic_body(image, encoding=0, mime=b"image/jpeg")
-    frame = b"APIC" + _syncsafe(len(apic_body)) + b"\x00\x00" + apic_body
-    # Apply unsync to the tag body (frames), not the 10-byte header.
-    unsynced_body = _unsync(frame)
-    header = b"ID3" + bytes([4, 0, 0x80]) + _syncsafe(len(unsynced_body))
+    encoded_body = _unsync(apic_body)
+    frame = b"APIC" + _syncsafe(len(encoded_body)) + b"\x00\x00" + encoded_body
+    # ID3v2.4 frame sizes describe the bytes stored after unsynchronisation.
+    header = b"ID3" + bytes([4, 0, 0x80]) + _syncsafe(len(frame))
     path = tmp_path / "unsync.mp3"
-    path.write_bytes(header + unsynced_body + b"\xff\xfb\x90\x00" + b"\x00" * 32)
+    path.write_bytes(header + frame + b"\xff\xfb\x90\x00" + b"\x00" * 32)
 
     got = embedded_cover_bytes(path)
     assert got == image
@@ -645,6 +645,33 @@ def test_id3_unsynchronisation_deescapes_jpeg(tmp_path: Path) -> None:
     assert b"\xff\x00" not in got or image.count(b"\xff\x00") == got.count(
         b"\xff\x00"
     )
+
+
+def test_id3v24_unsync_and_data_length_indicator(tmp_path: Path) -> None:
+    """Real exports combine frame unsync with a data-length indicator."""
+    image = _JPEG_1X1
+    apic_body = _apic_body(image, encoding=0, mime=b"image/jpeg")
+    encoded = _unsync(apic_body)
+    stored = _syncsafe(len(apic_body)) + encoded
+    frame = b"APIC" + _syncsafe(len(stored)) + b"\x00\x03" + stored
+    header = b"ID3" + bytes([4, 0, 0x80]) + _syncsafe(len(frame))
+    path = tmp_path / "unsync_dli.mp3"
+    path.write_bytes(header + frame + b"\xff\xfb\x90\x00" + b"\x00" * 32)
+
+    assert embedded_cover_bytes(path) == image
+
+
+def test_malformed_front_cover_falls_back_to_valid_picture(tmp_path: Path) -> None:
+    """A broken type-3 APIC must not hide another frame's usable JPEG."""
+    valid = _JPEG_1X1
+    other = _wrap_apic_v24(_apic_body(valid, encoding=0, pic_type=0))
+    broken_front = _wrap_apic_v24(
+        _apic_body(b"https://example.invalid/cover.jpg", encoding=0, pic_type=3)
+    )
+    path = tmp_path / "fallback.mp3"
+    path.write_bytes(_build_id3v2(major=4, frames=[other, broken_front]))
+
+    assert embedded_cover_bytes(path) == valid
 
 
 def test_id3_unsync_never_returns_escaped_ff00_corruption(tmp_path: Path) -> None:
@@ -1429,4 +1456,3 @@ def test_mp4_box_end_beyond_parent_stops(tmp_path: Path) -> None:
     path = tmp_path / "over_parent.m4a"
     path.write_bytes(ftyp + moov + b"\x00" * 50)
     assert embedded_cover_bytes(path) is None
-

@@ -204,7 +204,7 @@ def _id3_cover(f: BinaryIO) -> bytes | None:
         pass
 
     unsync = bool(flags & 0x80)
-    if unsync:
+    if unsync and major != 4:
         # Whole-tag unsynchronisation (v2.3 and earlier; rare on modern files).
         tag_body = _deunsync(tag_body)
 
@@ -228,12 +228,17 @@ def _id3_cover(f: BinaryIO) -> bytes | None:
     if major == 2:
         return _id3v22_frames(tag_body[offset:])
     if major in (3, 4):
-        return _id3v23_24_frames(tag_body[offset:], major=major)
+        return _id3v23_24_frames(tag_body[offset:], major=major, tag_unsync=unsync)
     _warn(f"tags: unsupported ID3 version 2.{major}")
     return None
 
 
-def _id3v23_24_frames(data: bytes, *, major: int) -> bytes | None:
+def _id3v23_24_frames(
+    data: bytes,
+    *,
+    major: int,
+    tag_unsync: bool = False,
+) -> bytes | None:
     """Walk ID3v2.3/v2.4 frames; prefer APIC picture type 3."""
     apics: list[tuple[int, bytes]] = []
     pos = 0
@@ -245,7 +250,7 @@ def _id3v23_24_frames(data: bytes, *, major: int) -> bytes | None:
             break
 
         size_bytes = data[pos + 4 : pos + 8]
-        # flags = data[pos + 8 : pos + 10]
+        flags = data[pos + 8 : pos + 10]
         if major == 4:
             frame_size = _syncsafe_size(size_bytes)
         else:
@@ -257,13 +262,60 @@ def _id3v23_24_frames(data: bytes, *, major: int) -> bytes | None:
             break
 
         if frame_id == b"APIC":
-            parsed = _parse_apic_body(data[body_start:body_end])
+            body = data[body_start:body_end]
+            if major == 4:
+                normalized = _id3v24_frame_payload(body, flags, tag_unsync=tag_unsync)
+            else:
+                normalized = body
+            parsed = _parse_apic_body(normalized) if normalized is not None else None
             if parsed is not None:
                 apics.append(parsed)
 
         pos = body_end
 
     return _pick_cover(apics)
+
+
+def _id3v24_frame_payload(
+    body: bytes,
+    flags: bytes,
+    *,
+    tag_unsync: bool,
+) -> bytes | None:
+    """Remove ID3v2.4 frame-format fields and unsynchronisation.
+
+    The second flag byte can prefix grouping identity, encryption method, and
+    a four-byte data-length indicator before the actual APIC body. Compressed
+    or encrypted frames cannot be decoded by this dependency-free reader.
+    """
+    if len(flags) != 2:
+        return None
+    format_flags = flags[1]
+    if format_flags & 0x0C:  # compression or encryption
+        return None
+
+    pos = 0
+    if format_flags & 0x40:  # grouping identity
+        pos += 1
+
+    expected_length: int | None = None
+    if format_flags & 0x01:  # data length indicator
+        if pos + 4 > len(body):
+            return None
+        expected_length = _syncsafe_size(body[pos : pos + 4])
+        pos += 4
+
+    if pos > len(body):
+        return None
+    payload = body[pos:]
+    if tag_unsync or format_flags & 0x02:
+        payload = _deunsync(payload)
+
+    if expected_length is not None:
+        if expected_length < 0 or len(payload) < expected_length:
+            return None
+        payload = payload[:expected_length]
+    return payload
 
 
 def _id3v22_frames(data: bytes) -> bytes | None:
@@ -362,10 +414,22 @@ def _find_desc_end(body: bytes, start: int, encoding: int) -> int | None:
 def _pick_cover(apics: list[tuple[int, bytes]]) -> bytes | None:
     if not apics:
         return None
-    for ptype, data in apics:
+    usable = [(ptype, data) for ptype, data in apics if _has_image_magic(data)]
+    candidates = usable or apics
+    for ptype, data in candidates:
         if ptype == _FRONT_COVER:
             return data
-    return apics[0][1]
+    return candidates[0][1]
+
+
+def _has_image_magic(data: bytes) -> bool:
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a", b"BM")):
+        return True
+    return bool(data.startswith(b"RIFF") and data[8:12] == b"WEBP")
 
 
 def _is_frame_id(frame_id: bytes) -> bool:
