@@ -4,7 +4,7 @@ rekordbox lists EVERY beat (~550 for a 6-min track). Engine wants SPARSE markers
 with tempo implied by (Δsample_offset)/(Δbeat_number) between adjacent markers.
 
 Algorithm (aligned with libdjinterop normalize_beatgrid + convert write path):
-1. Collapse constant-tempo runs to endpoints; emit a marker at each BPM change.
+1. Simplify the dense timestamp geometry while bounding reconstruction error.
 2. Shift the first marker so its beat index is -4 (Engine convention).
 3. Extrapolate the last marker to the first beat past total_samples.
 4. number_of_beats on each non-final marker = next.beat_number - this.beat_number.
@@ -20,8 +20,9 @@ import math
 from rb2engine.ir import SourceBeat, SourceBeatgrid
 from rb2engine.ir_engine import EngineBeatGrid, EngineBeatMarker
 
-# BPM stored as centi-bpm floats from ANLZ; equality within this is "same tempo".
-_BPM_EPS = 1e-4
+# Rekordbox timestamps are millisecond-quantized.  A one-millisecond vertical
+# error bound removes that noise while retaining audible/manual grid changes.
+_MAX_TIMING_ERROR_SECONDS = 0.001
 
 
 def compress_beatgrid(
@@ -35,14 +36,14 @@ def compress_beatgrid(
     Parameters
     ----------
     grid:
-        Source beatgrid (PQTZ beats; ``is_adjusted`` from PQT2 presence).
+        Source beatgrid (PQTZ beats, optionally refined by matched PQT2 timing
+        precision).
     sample_rate:
         Track sample rate in Hz (for tempo math / fallbacks).
     total_samples:
         Exact sample count for end-of-track extrapolation; ``None`` falls back
         to the last beat offset so mapping still succeeds without mutagen.
     """
-    del sample_rate  # reserved for future absolute-BPM reconstruction paths
     if not grid.beats:
         return EngineBeatGrid(
             default_markers=[],
@@ -50,13 +51,17 @@ def compress_beatgrid(
             is_beatgrid_set=False,
         )
 
-    sparse = _compress_dense(grid.beats)
+    tolerance_samples = max(
+        1.0,
+        float(sample_rate) * _MAX_TIMING_ERROR_SECONDS,
+    )
+    sparse = _compress_dense(grid.beats, tolerance_samples=tolerance_samples)
     sample_count = _resolve_sample_count(sparse, total_samples)
     normalized = _normalize_beatgrid(sparse, sample_count)
     markers = _with_number_of_beats(normalized)
 
     # Writer policy: adjusted grid must never be empty when a grid exists.
-    # Reader only supplies one dense list (PQTZ); is_adjusted is a flag only.
+    # Reader supplies one dense list (PQTZ plus optional PQT2 precision).
     return EngineBeatGrid(
         default_markers=markers,
         adjusted_markers=list(markers),
@@ -64,12 +69,19 @@ def compress_beatgrid(
     )
 
 
-def _same_tempo(a: SourceBeat, b: SourceBeat) -> bool:
-    return abs(a.bpm - b.bpm) <= _BPM_EPS
+def _compress_dense(
+    beats: list[SourceBeat],
+    *,
+    tolerance_samples: float,
+) -> list[EngineBeatMarker]:
+    """Simplify timestamp geometry with bounded vertical interpolation error.
 
-
-def _compress_dense(beats: list[SourceBeat]) -> list[EngineBeatMarker]:
-    """Keep first, last, and any beat where BPM changes from the previous."""
+    Rekordbox's reported BPM is centi-BPM metadata and is not precise enough to
+    describe manually warped or drifting grids.  Engine reconstructs a beat's
+    position by linearly interpolating between sparse markers, so marker
+    selection must use the same geometry.  This is a vertical-error variant of
+    Ramer-Douglas-Peucker with dense beat index as x and sample offset as y.
+    """
     n = len(beats)
     if n == 1:
         b = beats[0]
@@ -82,13 +94,29 @@ def _compress_dense(beats: list[SourceBeat]) -> list[EngineBeatMarker]:
             )
         ]
 
-    keep: list[int] = [0]
-    for i in range(1, n):
-        # Boundary: first beat of a new tempo.
-        if not _same_tempo(beats[i - 1], beats[i]) and keep[-1] != i:
-            keep.append(i)
-    if keep[-1] != n - 1:
-        keep.append(n - 1)
+    keep = {0, n - 1}
+    pending = [(0, n - 1)]
+    while pending:
+        first, last = pending.pop()
+        if last <= first + 1:
+            continue
+
+        first_offset = float(beats[first].sample_offset)
+        samples_per_beat = (float(beats[last].sample_offset) - first_offset) / (last - first)
+
+        worst_index = first + 1
+        worst_error = -1.0
+        for index in range(first + 1, last):
+            reconstructed = first_offset + (index - first) * samples_per_beat
+            error = abs(float(beats[index].sample_offset) - reconstructed)
+            if error > worst_error:
+                worst_index = index
+                worst_error = error
+
+        if worst_error > tolerance_samples:
+            keep.add(worst_index)
+            pending.append((first, worst_index))
+            pending.append((worst_index, last))
 
     return [
         EngineBeatMarker(
@@ -97,18 +125,17 @@ def _compress_dense(beats: list[SourceBeat]) -> list[EngineBeatMarker]:
             number_of_beats=0,
             unknown=0,
         )
-        for i in keep
+        for i in sorted(keep)
     ]
 
 
-def _resolve_sample_count(
-    markers: list[EngineBeatMarker], total_samples: int | None
-) -> int:
-    if total_samples is not None and total_samples > 0:
-        return int(total_samples)
-    # Fallback: treat last marker as the track end so we still extrapolate +1 beat.
+def _resolve_sample_count(markers: list[EngineBeatMarker], total_samples: int | None) -> int:
+    # Rekordbox's duration is integral seconds and can end before its final
+    # analyzed beats.  Never let that coarse value make normalization discard
+    # known grid geometry.
     last = markers[-1].sample_offset
-    return max(math.ceil(last), 1)
+    reported = int(total_samples) if total_samples is not None else 0
+    return max(reported, math.ceil(last), 1)
 
 
 def _normalize_beatgrid(
@@ -119,9 +146,7 @@ def _normalize_beatgrid(
         return []
 
     # Work on a mutable copy of (offset, index).
-    work: list[tuple[float, int]] = [
-        (m.sample_offset, int(m.beat_number)) for m in markers
-    ]
+    work: list[tuple[float, int]] = [(m.sample_offset, int(m.beat_number)) for m in markers]
 
     # Drop markers strictly after the first one past sample_count.
     last_past = None
@@ -162,9 +187,7 @@ def _normalize_beatgrid(
 
     # Last marker → first beat past usable end of track.
     last = len(work) - 1
-    spb_end = (work[last][0] - work[last - 1][0]) / (
-        work[last][1] - work[last - 1][1]
-    )
+    spb_end = (work[last][0] - work[last - 1][0]) / (work[last][1] - work[last - 1][1])
     if spb_end == 0:
         spb_end = spb if spb != 0 else 1.0
     index_adjustment = math.ceil((sample_count - work[last][0]) / spb_end)

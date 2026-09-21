@@ -144,7 +144,8 @@ Work in the track detail / player pane. Save cues after each track.
 2. **Nudge the downbeat** so it is clearly different from the automatic
    detection (e.g. shift by ~1 beat, or re-set the first downbeat by ear).
 3. Adjust BPM slightly if needed so the grid is visibly "edited".
-4. Save. This is the positive control for `is_adjusted` / PQT2 presence.
+4. Save. This is the positive control for a manually moved grid. Do not use
+   PQT2 presence alone as the edit signal; PQT2 is timestamp precision data.
 5. Same cover as t01 must still be attached.
 
 ### 3.3 `t03_tempo_change` — real tempo change (R6)

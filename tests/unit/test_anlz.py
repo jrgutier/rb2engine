@@ -65,24 +65,34 @@ def _pqtz(entries: list[tuple[int, int, int]]) -> bytes:
     return _tag("PQTZ", 24, content)
 
 
-def _pqt2_minimal(entry_count: int = 0) -> bytes:
-    """Minimal valid PQT2 header (two bpm anchors, optional empty entries)."""
+def _pqt2(
+    first: tuple[int, int, int] = (1, 12800, 0),
+    last: tuple[int, int, int] = (4, 12800, 60_000),
+    values_us: tuple[int, ...] = (),
+    *,
+    variant: int = 0x01000002,
+) -> bytes:
+    """PQT2 header plus one microsecond remainder per PQTZ beat."""
     # After common 12: pad4, const 0x01000002, pad4, 2× AnlzQuantizeTick, entry_count, u3,u4,u5
-    tick = _U16(1) + _U16(12800) + _U32(0)
-    tick2 = _U16(4) + _U16(12800) + _U32(60_000)
+    tick = _U16(first[0]) + _U16(first[1]) + _U32(first[2])
+    tick2 = _U16(last[0]) + _U16(last[1]) + _U32(last[2])
     content = (
         b"\x00" * 4
-        + _U32(0x01000002)
+        + _U32(variant)
         + b"\x00" * 4
         + tick
         + tick2
-        + _U32(entry_count)
+        + _U32(len(values_us))
         + _U32(0)
         + _U32(0)
         + _U32(0)
-        + b"\x00" * (2 * entry_count)
+        + b"".join(_U16(value) for value in values_us)
     )
     return _tag("PQT2", 56, content)
+
+
+def _pqt2_minimal(entry_count: int = 0) -> bytes:
+    return _pqt2(values_us=(0,) * entry_count)
 
 
 def _pcpt(
@@ -298,7 +308,7 @@ def test_pqtz_beats_converted_to_samples_at_given_rate(tmp_path: Path) -> None:
 
 
 def test_pqt2_presence_sets_is_adjusted(tmp_path: Path) -> None:
-    """PQT2 presence is rekordbox's own record of an extended/edited grid (E7)."""
+    """Retain the legacy IR signal when structurally valid PQT2 is present."""
     dat = _write(tmp_path / "x.DAT", _pmai([_pqtz([(1, 12000, 0), (2, 12000, 500)])]))
     ext = _write(tmp_path / "x.EXT", _pmai([_pqt2_minimal(0)]))
 
@@ -306,6 +316,80 @@ def test_pqt2_presence_sets_is_adjusted(tmp_path: Path) -> None:
     assert grid is not None
     assert grid.is_adjusted is True
     assert len(grid.beats) == 2  # positions still from PQTZ
+
+
+@pytest.mark.parametrize("variant", [0x00000002, 0x01000002, 0x02000002])
+def test_pqt2_refines_pqtz_with_microsecond_remainders(tmp_path: Path, variant: int) -> None:
+    """All observed header variants share additive fractional timestamps."""
+    entries = [(1, 12000, 0), (2, 12000, 500)]
+    dat = _write(tmp_path / "x.DAT", _pmai([_pqtz(entries)]))
+    ext = _write(
+        tmp_path / "x.EXT",
+        _pmai(
+            [
+                _pqt2(
+                    first=entries[0],
+                    last=entries[-1],
+                    values_us=(250, 500),
+                    variant=variant,
+                )
+            ]
+        ),
+    )
+
+    grid, _, warnings = read_anlz(dat, ext, 44100)
+
+    assert grid is not None
+    assert [beat.sample_offset for beat in grid.beats] == [11, 22072]
+    assert warnings == []
+
+
+def test_pqt2_count_mismatch_falls_back_to_pqtz(tmp_path: Path) -> None:
+    """Precision data is applied only when it pairs one-to-one with PQTZ."""
+    entries = [(1, 12000, 0), (2, 12000, 500)]
+    dat = _write(tmp_path / "x.DAT", _pmai([_pqtz(entries)]))
+    ext = _write(
+        tmp_path / "x.EXT",
+        _pmai([_pqt2(first=entries[0], last=entries[-1], values_us=(999,))]),
+    )
+
+    grid, _, warnings = read_anlz(dat, ext, 44100)
+
+    assert grid is not None
+    assert [beat.sample_offset for beat in grid.beats] == [0, 22050]
+    assert "pqt2_count_mismatch:pqtz=2,pqt2=1" in warnings
+
+
+def test_malformed_pqt2_does_not_drop_grid_or_later_cues(tmp_path: Path) -> None:
+    """Optional EXT precision failure must not erase authoritative data."""
+    entries = [(1, 12000, 0), (2, 12000, 500)]
+    dat = _write(tmp_path / "x.DAT", _pmai([_pqtz(entries)]))
+    # Claims two body entries but contains none. A PCO2 after it must still parse.
+    malformed_content = (
+        b"\x00" * 4
+        + _U32(0x02000002)
+        + b"\x00" * 4
+        + _U16(1)
+        + _U16(12000)
+        + _U32(0)
+        + _U16(2)
+        + _U16(12000)
+        + _U32(500)
+        + _U32(2)
+        + b"\x00" * 12
+    )
+    ext = _write(
+        tmp_path / "x.EXT",
+        _pmai([_tag("PQT2", 56, malformed_content), _pco2(1, [_pcp2(1, 250)])]),
+    )
+
+    grid, cues, warnings = read_anlz(dat, ext, 44100)
+
+    assert grid is not None
+    assert [beat.sample_offset for beat in grid.beats] == [0, 22050]
+    assert len(cues) == 1
+    assert cues[0].start_sample == ms_to_samples(250.0, 44100)
+    assert any(warning.startswith("pqt2_ignored:") for warning in warnings)
 
 
 def test_no_grid_returns_none(tmp_path: Path) -> None:

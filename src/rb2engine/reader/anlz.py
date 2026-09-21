@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import struct
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from construct import (
@@ -40,10 +41,35 @@ ALLOWLIST: frozenset[str] = frozenset({"PQTZ", "PQT2", "PCOB", "PCO2", "PPTH"})
 # Unset loop-out sentinel used by rekordbox (u32 -1).
 _LOOP_UNSET = 0xFFFFFFFF
 
+
+@dataclass(frozen=True, slots=True)
+class _PqtzBeat:
+    beat_in_bar: int
+    tempo_centi: int
+    time_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Pqt2Precision:
+    """Fractional timestamp data paired positionally with PQTZ beats.
+
+    Corpus evidence shows each body value is a 0–999 microsecond remainder
+    added to the corresponding whole-millisecond PQTZ timestamp.  The meaning
+    of the four-byte field at offset 16 remains unknown, so it is retained for
+    diagnostics but deliberately not interpreted as an adjustment flag.
+    """
+
+    variant: int
+    first_anchor: _PqtzBeat
+    last_anchor: _PqtzBeat
+    values_us: tuple[int, ...]
+
+
 # ---------------------------------------------------------------------------
 # Lenient PCOB layouts — mirror pyrekordbox.anlz.structs with Consts relaxed.
 # Real USB exports set status/u1 outside upstream Const assumptions.
-# PQTZ/PQT2/PPTH go through pyrekordbox.anlz.tags.TAGS instead.
+# PQTZ/PPTH go through pyrekordbox.anlz.tags.TAGS instead. PQT2 has a small
+# local parser because real exports use variants rejected by upstream Consts.
 # ---------------------------------------------------------------------------
 
 _PCPT_ENTRY = Struct(
@@ -114,7 +140,8 @@ def read_anlz(
         _raise_skipped("anlz_invalid_sample_rate", str(sample_rate))
 
     warnings: list[str] = []
-    pqtz_beats: list[SourceBeat] | None = None
+    pqtz_beats: list[_PqtzBeat] | None = None
+    pqt2_precision: _Pqt2Precision | None = None
     has_pqt2 = False
     pcob_cues: list[SourceCue] = []
     pco2_cues: list[SourceCue] = []
@@ -153,18 +180,26 @@ def read_anlz(
                 warnings.append(f"unknown_tag:{fourcc}")
                 continue
 
+            # PQT2 is optional precision metadata.  Unsupported variants or a
+            # damaged EXT tag must not discard the authoritative PQTZ grid or
+            # later PCO2 cues from the same file.
+            if fourcc == "PQT2":
+                try:
+                    pqt2_precision = _parse_pqt2(blob)
+                    has_pqt2 = True
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"pqt2_ignored:{path.name}:{exc}")
+                continue
+
             try:
                 if fourcc == "PQTZ":
-                    parsed = _parse_pqtz(blob, sample_rate)
+                    parsed = _parse_pqtz(blob)
                     # DAT analyzed grid is the full beat list; keep first unless
-                    # we later decide EXT carries a replacement (it does not —
-                    # PQT2 has no per-beat times). Last PQTZ wins if both files
-                    # somehow carry one (DAT is the normal source).
+                    # we later decide EXT carries a replacement. PQT2 only
+                    # refines these timestamps below. Last PQTZ wins if both
+                    # files somehow carry one (DAT is the normal source).
                     if kind == "dat" or pqtz_beats is None:
                         pqtz_beats = parsed
-                elif fourcc == "PQT2":
-                    _parse_pqt2(blob)  # validate layout
-                    has_pqt2 = True
                 elif fourcc == "PCOB":
                     # Only collect PCOB when we do not yet have PCO2 cues from EXT.
                     # Always parse DAT PCOB as fallback material.
@@ -183,7 +218,16 @@ def read_anlz(
 
     grid: SourceBeatgrid | None = None
     if pqtz_beats is not None:
-        grid = SourceBeatgrid(beats=pqtz_beats, is_adjusted=has_pqt2)
+        source_beats = _source_beats(
+            pqtz_beats,
+            pqt2_precision,
+            sample_rate,
+            warnings,
+        )
+        # Keep the existing IR signal for compatibility. PQT2 presence alone
+        # is not evidence that a user edited the grid; mapper output does not
+        # branch on this flag.
+        grid = SourceBeatgrid(beats=source_beats, is_adjusted=has_pqt2)
     elif has_pqt2:
         # PQT2 present without PQTZ: cannot build a full grid from known fields.
         warnings.append("pqt2_without_pqtz")
@@ -249,7 +293,7 @@ def _body(blob: bytes) -> bytes:
 def _parse_via_tags_registry(fourcc: str, blob: bytes):
     """Parse an allowlisted tag through pyrekordbox's semi-public TAGS registry.
 
-    Used for PQTZ / PQT2 / PPTH where upstream Const fields match real exports.
+    Used for PQTZ / PPTH where upstream Const fields match real exports.
     PCOB/PCO2 use lenient local structs — upstream Const(u1=0x10000) and
     fixed-length PCO2 entries fail on this stick (status=1, truncated colors).
     """
@@ -265,11 +309,11 @@ def _parse_via_tags_registry(fourcc: str, blob: bytes):
         raise  # unreachable
 
 
-def _parse_pqtz(blob: bytes, sample_rate: int) -> list[SourceBeat]:
+def _parse_pqtz(blob: bytes) -> list[_PqtzBeat]:
     tag = _parse_via_tags_registry("PQTZ", blob)
     content = tag.content
 
-    beats: list[SourceBeat] = []
+    beats: list[_PqtzBeat] = []
     for entry in content.entries:
         beat_in_bar = int(entry.beat)
         if not 1 <= beat_in_bar <= 4:
@@ -277,18 +321,87 @@ def _parse_pqtz(blob: bytes, sample_rate: int) -> list[SourceBeat]:
         tempo_centi = int(entry.tempo)
         time_ms = int(entry.time)
         beats.append(
-            SourceBeat(
+            _PqtzBeat(
                 beat_in_bar=beat_in_bar,
-                sample_offset=ms_to_samples(float(time_ms), sample_rate),
-                bpm=tempo_centi / 100.0,
+                tempo_centi=tempo_centi,
+                time_ms=time_ms,
             )
         )
     return beats
 
 
-def _parse_pqt2(blob: bytes) -> None:
-    """Validate PQT2 via TAGS. Full per-beat times are not available in this tag."""
-    _parse_via_tags_registry("PQT2", blob)
+def _parse_pqt2(blob: bytes) -> _Pqt2Precision:
+    """Parse the stable PQT2 envelope without pinning its unknown variant field.
+
+    pyrekordbox 0.4.4 constrains the field at offset 16 to ``0x01000002``.
+    Real exports in the local corpus also use ``0x02000002`` and
+    ``0x00000002`` with the same structural layout.  Parsing the small known
+    layout locally prevents that upstream Const from dropping unrelated cues.
+    """
+    if len(blob) < 56:
+        raise ValueError(f"short_tag:{len(blob)}")
+    if blob[:4] != b"PQT2":
+        raise ValueError(f"bad_magic:{blob[:4]!r}")
+
+    declared_header, declared_length = struct.unpack_from(">II", blob, 4)
+    if declared_header != 56:
+        raise ValueError(f"header_length={declared_header}")
+    if declared_length != len(blob):
+        raise ValueError(f"tag_length={declared_length},actual={len(blob)}")
+
+    variant = struct.unpack_from(">I", blob, 16)[0]
+    first_anchor = _PqtzBeat(*struct.unpack_from(">HHI", blob, 24))
+    last_anchor = _PqtzBeat(*struct.unpack_from(">HHI", blob, 32))
+    entry_count = struct.unpack_from(">I", blob, 40)[0]
+    expected_length = 56 + entry_count * 2
+    if len(blob) != expected_length:
+        raise ValueError(f"length={len(blob)},expected={expected_length}")
+    values = tuple(
+        struct.unpack_from(">H", blob, 56 + index * 2)[0] for index in range(entry_count)
+    )
+    invalid = next((value for value in values if value > 999), None)
+    if invalid is not None:
+        raise ValueError(f"fraction_us={invalid}")
+    return _Pqt2Precision(
+        variant=variant,
+        first_anchor=first_anchor,
+        last_anchor=last_anchor,
+        values_us=values,
+    )
+
+
+def _source_beats(
+    beats: list[_PqtzBeat],
+    precision: _Pqt2Precision | None,
+    sample_rate: int,
+    warnings: list[str],
+) -> list[SourceBeat]:
+    """Convert PQTZ to samples, applying PQT2 only when invariants match."""
+    values_us: tuple[int, ...] | None = None
+    if precision is not None and precision.values_us:
+        if len(precision.values_us) != len(beats):
+            warnings.append(
+                f"pqt2_count_mismatch:pqtz={len(beats)},pqt2={len(precision.values_us)}"
+            )
+        elif not beats:
+            warnings.append("pqt2_without_pqtz")
+        elif precision.first_anchor != beats[0] or precision.last_anchor != beats[-1]:
+            warnings.append("pqt2_anchor_mismatch")
+        else:
+            values_us = precision.values_us
+
+    result: list[SourceBeat] = []
+    for index, beat in enumerate(beats):
+        fraction_us = values_us[index] if values_us is not None else 0
+        time_ms = beat.time_ms + fraction_us / 1000.0
+        result.append(
+            SourceBeat(
+                beat_in_bar=beat.beat_in_bar,
+                sample_offset=ms_to_samples(time_ms, sample_rate),
+                bpm=beat.tempo_centi / 100.0,
+            )
+        )
+    return result
 
 
 def _parse_ppth(blob: bytes) -> str:
@@ -411,9 +524,7 @@ def _parse_pco2(blob: bytes, sample_rate: int) -> list[SourceCue]:
         hot_cue = struct.unpack_from(">I", entry, 12)[0]
         cue_type = entry[16] if len(entry) > 16 else 1
         time_ms = struct.unpack_from(">I", entry, 20)[0] if len(entry) >= 24 else 0
-        loop_time = (
-            struct.unpack_from(">I", entry, 24)[0] if len(entry) >= 28 else _LOOP_UNSET
-        )
+        loop_time = struct.unpack_from(">I", entry, 24)[0] if len(entry) >= 28 else _LOOP_UNSET
         color_id = entry[28] if len(entry) > 28 else 0
 
         comment = ""

@@ -8,6 +8,8 @@ tests pin the compression invariants that keep grids aligned mid-set.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 
 from rb2engine.ir import SourceBeat, SourceBeatgrid
@@ -82,9 +84,7 @@ def _dense_tempo_change(
     return SourceBeatgrid(beats=beats, is_adjusted=False)
 
 
-def _implied_bpm(
-    a: EngineBeatMarker, b: EngineBeatMarker, sample_rate: int = SAMPLE_RATE
-) -> float:
+def _implied_bpm(a: EngineBeatMarker, b: EngineBeatMarker, sample_rate: int = SAMPLE_RATE) -> float:
     """Tempo Engine infers between adjacent markers."""
     d_beats = b.beat_number - a.beat_number
     assert d_beats != 0
@@ -96,6 +96,26 @@ def _markers(grid: EngineBeatGrid) -> list[EngineBeatMarker]:
     # default and adjusted must agree when only PQTZ is available
     assert grid.default_markers == grid.adjusted_markers
     return grid.default_markers
+
+
+def _reconstruct(markers: list[EngineBeatMarker], beat_number: int) -> float:
+    """Return Engine's linear interpolation at one dense beat index."""
+    for left, right in pairwise(markers):
+        if left.beat_number <= beat_number <= right.beat_number:
+            span = right.beat_number - left.beat_number
+            fraction = (beat_number - left.beat_number) / span
+            return left.sample_offset + fraction * (right.sample_offset - left.sample_offset)
+    raise AssertionError(f"beat {beat_number} is outside marker range")
+
+
+def _max_reconstruction_error(
+    source: SourceBeatgrid,
+    markers: list[EngineBeatMarker],
+) -> float:
+    return max(
+        abs(_reconstruct(markers, index) - beat.sample_offset)
+        for index, beat in enumerate(source.beats)
+    )
 
 
 class TestConstantTempoCollapses:
@@ -186,6 +206,79 @@ class TestTempoChange:
         assert markers[1].sample_offset == pytest.approx(boundary_sample, abs=1.0)
 
 
+class TestTimestampGeometry:
+    """Marker selection follows actual positions, not the coarse BPM field."""
+
+    def test_continuous_drift_with_constant_reported_bpm_stays_within_one_ms(
+        self,
+    ) -> None:
+        beats = [
+            SourceBeat(
+                beat_in_bar=index % 4 + 1,
+                sample_offset=round(index * 22_050 + index * index * 1.75),
+                bpm=120.0,
+            )
+            for index in range(160)
+        ]
+        src = SourceBeatgrid(beats=beats, is_adjusted=False)
+        total = beats[-1].sample_offset + 22_050
+
+        markers = _markers(compress_beatgrid(src, sample_rate=SAMPLE_RATE, total_samples=total))
+
+        assert len(markers) > 2
+        assert _max_reconstruction_error(src, markers) <= SAMPLE_RATE / 1000
+
+    def test_millisecond_quantization_noise_still_collapses_fixed_grid(self) -> None:
+        beats = [
+            SourceBeat(
+                beat_in_bar=index % 4 + 1,
+                sample_offset=round(round(index * 500.0) * SAMPLE_RATE / 1000),
+                bpm=120.0,
+            )
+            for index in range(128)
+        ]
+        src = SourceBeatgrid(beats=beats, is_adjusted=False)
+        total = beats[-1].sample_offset + 22_050
+
+        markers = _markers(compress_beatgrid(src, sample_rate=SAMPLE_RATE, total_samples=total))
+
+        assert len(markers) == 2
+        assert _max_reconstruction_error(src, markers) <= SAMPLE_RATE / 1000
+
+    def test_isolated_manual_correction_is_retained(self) -> None:
+        src = _dense_constant(120.0, 96)
+        corrected = list(src.beats)
+        beat = corrected[48]
+        corrected[48] = SourceBeat(
+            beat_in_bar=beat.beat_in_bar,
+            sample_offset=beat.sample_offset + 500,
+            bpm=beat.bpm,
+        )
+        src = SourceBeatgrid(beats=corrected, is_adjusted=True)
+        total = corrected[-1].sample_offset + 22_050
+
+        markers = _markers(compress_beatgrid(src, sample_rate=SAMPLE_RATE, total_samples=total))
+
+        assert any(marker.beat_number == 48 for marker in markers)
+        assert _max_reconstruction_error(src, markers) <= SAMPLE_RATE / 1000
+
+    def test_reported_duration_cannot_trim_late_source_beats(self) -> None:
+        src = _dense_constant(120.0, 32)
+        # Rekordbox duration is second-granular and can precede analyzed beats.
+        reported_total = src.beats[-5].sample_offset
+
+        markers = _markers(
+            compress_beatgrid(
+                src,
+                sample_rate=SAMPLE_RATE,
+                total_samples=reported_total,
+            )
+        )
+
+        assert markers[-1].beat_number > len(src.beats) - 1
+        assert _max_reconstruction_error(src, markers) <= SAMPLE_RATE / 1000
+
+
 class TestRealWorldSizedGrid:
     """~550 beats must compress to a tiny marker list.
 
@@ -222,9 +315,7 @@ class TestDownbeatAlignment:
         # downbeat is beat 0 ≡ 0 (mod 4).
         spb = (m1.sample_offset - m0.sample_offset) / (m1.beat_number - m0.beat_number)
         first_downbeat_sample = m0.sample_offset + (0 - m0.beat_number) * spb
-        assert first_downbeat_sample == pytest.approx(
-            float(src.beats[0].sample_offset), abs=1.0
-        )
+        assert first_downbeat_sample == pytest.approx(float(src.beats[0].sample_offset), abs=1.0)
         assert m0.beat_number % 4 == 0  # -4
 
 
@@ -246,7 +337,7 @@ class TestEmptyAndEdgeCases:
         assert _markers(out)[0].beat_number == -4
 
     def test_is_adjusted_still_populates_both_grids(self) -> None:
-        """PQT2 presence flags is_adjusted; without separate PQT2 times both grids match.
+        """A legacy is_adjusted signal still produces two complete Engine grids.
 
         WHY: Engine reads the adjusted grid for playback — it must never be empty
         when a grid exists (write policy).

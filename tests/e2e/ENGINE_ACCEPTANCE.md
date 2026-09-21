@@ -60,7 +60,7 @@ the real stick (Tier B).
 |---|---|
 | **Steps** | Load `t02_adjusted_grid`. Display the beatgrid / waveform grid. Compare **downbeat** alignment and **BPM** readout to rekordbox for the same track (±1 ms / exact BPM). |
 | **Pass** | Downbeat and BPM match the adjusted rekordbox grid, not the pre-edit automatic grid. |
-| **Mechanical proxy** | Fixture `t02_adjusted_grid`; decode written `beatData` and assert marker `sample_offset` within **0 samples** of mapped ANLZ; first marker beat index **-4**; `adjusted_beat_grid` from PQT2 and `default_beat_grid` from PQTZ; M2 golden encode/decode round-trip on Engine-authored blobs. |
+| **Mechanical proxy** | Fixture `t02_adjusted_grid`; decode written `beatData` and assert marker `sample_offset` within **0 samples** of mapped ANLZ; first marker beat index **-4**; both Engine grids contain the PQTZ geometry refined by structurally matched PQT2 microsecond timing; M2 golden encode/decode round-trip on Engine-authored blobs. |
 
 ### 4b. Tempo-change grid — `t03_tempo_change` (R6)
 
