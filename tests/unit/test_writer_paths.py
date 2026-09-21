@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -173,6 +174,41 @@ def test_nested_contents_path_preserves_structure(tmp_path: Path) -> None:
         )
         == "Contents/Artist/Album/Track Name.mp3"
     )
+
+
+@pytest.mark.parametrize("base", ["engine-lib", "drive-root", "absolute"])
+def test_stored_path_is_nfc_when_host_returns_decomposed_names(tmp_path: Path, base: str) -> None:
+    """macOS NFD filesystem names must not leak into Engine Track.path.
+
+    The Prime Go+ marks such rows red and reports "File unavailable". The
+    resolved Path must keep its host spelling for local reads, while the
+    portable database string uses the composed spelling from rekordbox.
+    """
+    nfc_artist = "Sällskapet"
+    nfd_artist = unicodedata.normalize("NFD", nfc_artist)
+    assert nfc_artist != nfd_artist
+
+    drive_root = tmp_path / "stick"
+    engine_library_dir = drive_root / "Engine Library"
+    music_abs = drive_root / "Contents" / nfd_artist / "10 Hauptbahnhof.mp3"
+    music_abs.parent.mkdir(parents=True)
+    music_abs.write_bytes(b"audio")
+    engine_library_dir.mkdir()
+
+    stored_artist = music_abs.parent.name
+    if stored_artist != nfd_artist:
+        pytest.skip("filesystem normalized the decomposed fixture name")
+
+    got = engine_track_path(
+        music_abs,
+        drive_root=drive_root,
+        engine_library_dir=engine_library_dir,
+        base=base,
+    )
+
+    assert unicodedata.is_normalized("NFC", got)
+    assert nfc_artist in got
+    assert nfd_artist not in got
 
 
 def test_path_outside_drive_root_raises(tmp_path: Path) -> None:

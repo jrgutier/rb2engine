@@ -11,12 +11,25 @@ absolute is reachable only when explicitly requested and can never be default.
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 # Compiled-in default for --path-base. Must never be "absolute" (C-MAJOR-2).
 DEFAULT_PATH_BASE = "engine-lib"
 
 _VALID_BASES = frozenset({"engine-lib", "drive-root", "absolute"})
+
+
+def _engine_path_text(path: str) -> str:
+    """Return Engine's portable Unicode spelling for a stored path.
+
+    macOS exposes names read from removable media in decomposed form (NFD),
+    even when rekordbox stored the conceptual path in composed form (NFC).
+    Engine players fail to resolve database paths containing those combining
+    sequences. Local file access must retain the host spelling, but the string
+    written to ``Track.path`` must be NFC.
+    """
+    return unicodedata.normalize("NFC", path)
 
 
 def engine_track_path(
@@ -57,11 +70,11 @@ def engine_track_path(
         ) from exc
 
     if base == "absolute":
-        return music.as_posix()
+        return _engine_path_text(music.as_posix())
 
     if base == "drive-root":
         rel = music.relative_to(root)
-        return PurePosixPath(*rel.parts).as_posix()
+        return _engine_path_text(PurePosixPath(*rel.parts).as_posix())
 
     # engine-lib: relative to Engine Library/ (not Database2/).
     lib = Path(engine_library_dir).resolve()
@@ -71,7 +84,7 @@ def engine_track_path(
     # otherwise walk from lib up to root then down into Contents/.
     try:
         under_lib = music.relative_to(lib)
-        return PurePosixPath(*under_lib.parts).as_posix()
+        return _engine_path_text(PurePosixPath(*under_lib.parts).as_posix())
     except ValueError:
         pass
 
@@ -85,4 +98,4 @@ def engine_track_path(
 
     ups = len(lib_from_root.parts)
     parts = ("..",) * ups + tuple(rel.parts)
-    return PurePosixPath(*parts).as_posix() if parts else "."
+    return _engine_path_text(PurePosixPath(*parts).as_posix()) if parts else "."
