@@ -98,6 +98,8 @@ class SourceTrack:
     Defaulted and last so existing constructions stay valid; a dataclass field
     with a default may not precede fields without one.
     """
+    waveform_preview: bytes | None = None
+    """``.2EX`` PWV6 entries — becomes Engine's overview waveform."""
 
 
 @dataclass(frozen=True, slots=True)

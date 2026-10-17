@@ -37,8 +37,10 @@ from rb2engine.writer.blobs import (
     decode_track_data,
     encode_beat_data,
     encode_loops,
+    encode_overview_waveform,
     encode_quick_cues,
     encode_track_data,
+    overview_from_pwv6,
 )
 
 GOLDEN_DB = (
@@ -549,3 +551,22 @@ def test_negative_beat_number_roundtrip_explicit() -> None:
     out = decode_beat_data(encode_beat_data(bd))
     assert out.default_beat_grid.markers[0].beat_number == -4
     assert out.adjusted_beat_grid.markers[0].beat_number == -4
+
+
+def test_golden_overview_waveform_round_trips() -> None:
+    blob = _load_performance_blobs()[0]["overviewWaveFormData"]
+    assert blob
+    assert encode_overview_waveform(decode_overview_waveform(blob)) == blob
+
+
+def test_overview_from_pwv6_reorders_bands_rescales_and_resamples() -> None:
+    # PWV6 entries are (mid, high, low) on a 0-127 scale; Engine points are
+    # (low, mid, high) on 0-255, always 1024 of them.
+    entries = bytes([20, 30, 10] * 600 + [21, 31, 127] * 600)
+    ow = overview_from_pwv6(entries, samples=2048 * 100)
+
+    assert ow.num_points == 1024
+    assert ow.samples_per_waveform_point == 200.0
+    assert ow.points[0] == (20, 40, 60)
+    assert ow.points[-1] == (254, 42, 62)
+    assert ow.max_point == (254, 42, 62)

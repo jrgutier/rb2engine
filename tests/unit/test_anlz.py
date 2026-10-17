@@ -21,7 +21,7 @@ import pytest
 
 from rb2engine.errors import TrackSkipped
 from rb2engine.ir import RGB, CueKind
-from rb2engine.reader.anlz import ALLOWLIST, read_anlz, tag_index
+from rb2engine.reader.anlz import ALLOWLIST, read_anlz, read_waveform_preview, tag_index
 from rb2engine.units import ms_to_samples
 
 # ---------------------------------------------------------------------------
@@ -545,3 +545,15 @@ def test_real_stick_known_loop_file() -> None:
     loops = [c for c in cues if c.is_loop]
     assert loops, f"expected at least one loop cue, got {cues!r}"
     assert all(c.end_sample is not None for c in loops)
+
+
+def test_read_waveform_preview_returns_pwv6_entries(tmp_path: Path) -> None:
+    entries = bytes([1, 2, 3, 4, 5, 6])
+    pwv6 = _tag("PWV6", 20, _U32(3) + _U32(2) + entries)
+    path = _write(tmp_path / "ANLZ0000.2EX", _pmai([_ppth("/x.mp3"), pwv6]))
+    assert read_waveform_preview(path) == entries
+
+
+def test_read_waveform_preview_none_without_pwv6(tmp_path: Path) -> None:
+    path = _write(tmp_path / "ANLZ0000.2EX", _pmai([_ppth("/x.mp3")]))
+    assert read_waveform_preview(path) is None

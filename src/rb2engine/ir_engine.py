@@ -108,6 +108,7 @@ class EngineTrack:
     beat_grid: EngineBeatGrid
     quick_cues: list[QuickCueSlot]  # always length 8
     loops: list[LoopSlot]  # always length 8
+    waveform_preview: bytes | None = None  # rekordbox PWV6 → overviewWaveFormData
 
 
 @dataclass(frozen=True, slots=True)

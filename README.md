@@ -176,7 +176,7 @@ Still: **it's a DJ library. Back it up before you point a new tool at it.**
 
 **More than 8 cues on a track.** Engine has 8 pads. Hot cues keep their original pad; memory cues fill what's left chronologically; anything beyond 8 is dropped and itemised per-track in the report. Loops go to Engine's separate 8 loop slots, so a looped hot cue frees its pad.
 
-**Waveforms aren't generated.** Engine builds those itself when it analyses a track. Beatgrids, cues and loops are what has to survive the conversion, and they do.
+**The overview waveform comes from rekordbox; the scrolling one doesn't.** rekordbox's 3-band preview (`.2EX` `PWV6`) becomes Engine's overview waveform, because converted tracks are marked analysed and the hardware never fills an empty one. The scrolling waveform is drawn by the player on load. Tracks without a `.2EX` keep an empty overview.
 
 ## Supported versions
 

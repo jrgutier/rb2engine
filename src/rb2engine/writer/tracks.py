@@ -1,8 +1,8 @@
 """Track INSERT → PerformanceData UPDATE for trigger-created rows.
 
 Never INSERT into PerformanceData — trigger_after_insert_Track_insert_performance_data
-already creates the row. overviewWaveFormData is left at the trigger default
-(NULL): Engine regenerates waveforms on analysis (project non-goal).
+already creates the row. overviewWaveFormData comes from rekordbox's PWV6
+preview: tracks are marked analysed, so hardware never fills a NULL overview.
 """
 
 from __future__ import annotations
@@ -25,8 +25,10 @@ from rb2engine.writer.blobs import (
     TrackData,
     encode_beat_data,
     encode_loops,
+    encode_overview_waveform,
     encode_quick_cues,
     encode_track_data,
+    overview_from_pwv6,
 )
 
 # Engine-exported shape for Track.albumArt when albumArtId is set.
@@ -250,14 +252,20 @@ def _insert_one_track(
 
 
 def _update_performance_data(conn: sqlite3.Connection, track_id: int, track: EngineTrack) -> None:
-    """UPDATE only the four blob columns we own — never overviewWaveFormData."""
+    """UPDATE the performance blobs; overviewWaveFormData stays NULL without a PWV6 preview."""
+    overview = (
+        encode_overview_waveform(overview_from_pwv6(track.waveform_preview, track.samples))
+        if track.waveform_preview
+        else None
+    )
     conn.execute(
         """
         UPDATE PerformanceData
         SET trackData = ?,
             beatData = ?,
             quickCues = ?,
-            loops = ?
+            loops = ?,
+            overviewWaveFormData = ?
         WHERE trackId = ?
         """,
         (
@@ -265,6 +273,7 @@ def _update_performance_data(conn: sqlite3.Connection, track_id: int, track: Eng
             encode_beat_data(_beat_data(track)),
             encode_quick_cues(_quick_cues(track)),
             encode_loops(_loops(track)),
+            overview,
             track_id,
         ),
     )

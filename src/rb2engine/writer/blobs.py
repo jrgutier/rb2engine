@@ -118,7 +118,7 @@ class Loops:
 
 @dataclass(frozen=True, slots=True)
 class OverviewWaveform:
-    """Decoded overviewWaveFormData (read-only; rb2engine never writes this)."""
+    """Decoded overviewWaveFormData."""
 
     num_points: int
     samples_per_waveform_point: float
@@ -439,7 +439,7 @@ def encode_loops(data: Loops) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# overviewWaveFormData — zlib; decode only (we never write it)
+# overviewWaveFormData — zlib; BE counts + (low, mid, high) bytes + max point
 # ---------------------------------------------------------------------------
 
 
@@ -472,3 +472,29 @@ def decode_overview_waveform(blob: bytes) -> OverviewWaveform:
         points=points,
         max_point=max_point,
     )
+
+
+OVERVIEW_POINTS = 1024
+
+
+def encode_overview_waveform(data: OverviewWaveform) -> bytes:
+    header = struct.pack(">qqd", data.num_points, data.num_points, data.samples_per_waveform_point)
+    body = b"".join(bytes(p) for p in data.points)
+    return _compress_frame(header + body + bytes(data.max_point))
+
+
+def overview_from_pwv6(entries: bytes, samples: int) -> OverviewWaveform:
+    """rekordbox 3-band preview (``.2EX`` PWV6) → Engine overview.
+
+    PWV6 entries are (mid, high, low) on a 0–127 scale; Engine stores 1024
+    (low, mid, high) points on 0–255, so bands are reordered and doubled.
+    Resampled by the nearest entry at each point's centre.
+    """
+    n = len(entries) // 3
+    points = []
+    for i in range(OVERVIEW_POINTS):
+        j = 3 * (n * (2 * i + 1) // (2 * OVERVIEW_POINTS))
+        mid, high, low = (min(v * 2, 255) for v in entries[j : j + 3])
+        points.append((low, mid, high))
+    max_point = tuple(max(p[b] for p in points) for b in range(3))
+    return OverviewWaveform(OVERVIEW_POINTS, samples / OVERVIEW_POINTS, points, max_point)  # type: ignore[arg-type]

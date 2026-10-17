@@ -83,6 +83,7 @@ def map_track(
         beat_grid=beat_grid,
         quick_cues=quick_cues,
         loops=loops,
+        waveform_preview=src.waveform_preview,
     )
 
 

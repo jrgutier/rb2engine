@@ -20,7 +20,7 @@ from pathlib import Path
 
 from rb2engine.ir import SourceLibrary, SourceTrack
 from rb2engine.progress import ProgressCallback
-from rb2engine.reader.anlz import read_anlz
+from rb2engine.reader.anlz import read_anlz, read_waveform_preview
 from rb2engine.reader.artwork import extract_artwork
 from rb2engine.reader.pdb import parse_export_pdb
 from rb2engine.reader.scan import resolve_anlz_paths, scan_drive
@@ -80,6 +80,7 @@ def read_library(
         beatgrid = track.beatgrid
         cues = track.cues
         artwork = track.artwork
+        waveform_preview = track.waveform_preview
 
         if with_anlz and track.analyze_path:
             try:
@@ -95,12 +96,21 @@ def read_library(
                         warnings.extend(f"track {tid}: {w}" for w in anlz_warnings)
                     except Exception as exc:  # noqa: BLE001 - skip+report, per policy
                         warnings.append(f"track {tid}: ANLZ unreadable: {exc}")
+                if paths.two_ex is not None:
+                    try:
+                        waveform_preview = read_waveform_preview(paths.two_ex)
+                    except Exception as exc:  # noqa: BLE001 - overview is optional
+                        warnings.append(f"track {tid}: 2EX unreadable: {exc}")
 
         if with_artwork and track.resolved_path is not None:
             artwork = extract_artwork(track.resolved_path)
 
         tracks[tid] = dataclasses.replace(
-            track, beatgrid=beatgrid, cues=cues, artwork=artwork
+            track,
+            beatgrid=beatgrid,
+            cues=cues,
+            artwork=artwork,
+            waveform_preview=waveform_preview,
         )
         if on_progress is not None:
             on_progress("reading tracks", done, total)

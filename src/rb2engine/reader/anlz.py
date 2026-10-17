@@ -474,3 +474,14 @@ def _tags_registry() -> dict:
 
 
 __all__ = ["ALLOWLIST", "read_anlz", "tag_index"]
+
+
+def read_waveform_preview(path: Path) -> bytes | None:
+    """Raw PWV6 entries (3 bytes each: mid, high, low) from a ``.2EX`` file, or None."""
+    for fourcc, len_header, _len_tag, blob in _iter_raw_tags(Path(path).read_bytes()):
+        if fourcc == "PWV6" and len_header >= 20:
+            entry_bytes, count = struct.unpack_from(">II", blob, 12)
+            entries = blob[len_header : len_header + entry_bytes * count]
+            if entry_bytes == 3 and count and len(entries) == 3 * count:
+                return entries
+    return None

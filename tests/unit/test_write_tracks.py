@@ -37,6 +37,7 @@ from rb2engine.writer.blobs import (
     TrackData,
     decode_beat_data,
     decode_loops,
+    decode_overview_waveform,
     decode_quick_cues,
     decode_track_data,
     encode_beat_data,
@@ -242,7 +243,7 @@ def test_performance_data_row_exists_without_explicit_insert(
     ).fetchone()
     assert row is not None
     assert row[0] == engine_id
-    # overviewWaveFormData is a deliberate non-goal — leave trigger default (NULL).
+    # No PWV6 preview on this track, so the overview stays at the trigger default (NULL).
     assert row[5] is None
 
 
@@ -485,3 +486,15 @@ def test_schema_3_0_2_insert_does_not_require_album_art_source_hash(
         )
     finally:
         conn.close()
+
+
+def test_waveform_preview_written_as_overview(conn: sqlite3.Connection) -> None:
+    track = _make_track(waveform_preview=bytes([20, 30, 10] * 1200))
+    engine_id = next(iter(insert_tracks(conn, [track]).values()))
+    blob = conn.execute(
+        "SELECT overviewWaveFormData FROM PerformanceData WHERE trackId = ?",
+        (engine_id,),
+    ).fetchone()[0]
+    ow = decode_overview_waveform(blob)
+    assert ow.num_points == 1024
+    assert ow.points[0] == (20, 40, 60)
