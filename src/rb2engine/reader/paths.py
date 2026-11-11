@@ -87,6 +87,28 @@ def resolve_track_path(raw_path: str, drive_root: Path) -> Path | None:
     return resolved
 
 
+def resolve_artwork_path(raw_path: str, drive_root: Path) -> Path | None:
+    """Map a pdb artwork-row path (``/PIONEER/Artwork/00001/a1.jpg``) to a file.
+
+    Only paths under ``PIONEER/Artwork`` are accepted — the pdb is untrusted
+    input, so ``..`` or any other location never resolves.
+    """
+    if not raw_path or not isinstance(drive_root, Path):
+        return None
+    segments = [p for p in PurePosixPath(raw_path.replace("\\", "/")).parts if p and p != "/"]
+    if (
+        len(segments) < 3
+        or fold_name(segments[0]) != "pioneer"
+        or fold_name(segments[1]) != "artwork"
+        or any(s in (".", "..") for s in segments)
+    ):
+        return None
+    resolved = _resolve_case_insensitive(drive_root, segments)
+    if resolved is None or not resolved.is_file():
+        return None
+    return resolved
+
+
 def _resolve_case_insensitive(root: Path, segments: list[str]) -> Path | None:
     """Walk ``segments`` under ``root``, matching each name case-insensitively.
 

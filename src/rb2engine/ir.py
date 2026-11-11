@@ -98,6 +98,9 @@ class SourceTrack:
     Defaulted and last so existing constructions stay valid; a dataclass field
     with a default may not precede fields without one.
     """
+    artwork_path: str | None = None
+    """pdb artwork row path (``/PIONEER/Artwork/…``) — fallback when the audio
+    file has no embedded cover."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -403,6 +403,14 @@ def _parse_key_row(page: bytes, row_base: int) -> tuple[int, str]:
     return kid, name
 
 
+def _parse_artwork_row(page: bytes, row_base: int) -> tuple[int, str]:
+    """Artwork row: id (u4) + DeviceSQL path string, e.g. /PIONEER/Artwork/00001/a1.jpg."""
+    _need(page, row_base, 5, "artwork")
+    aid = struct.unpack_from("<I", page, row_base)[0]
+    path = _string_at(page, row_base, 4)
+    return aid, path
+
+
 def _parse_color_row(page: bytes, row_base: int) -> tuple[int, str]:
     _need(page, row_base, 9, "color")
     cid = struct.unpack_from("<H", page, row_base + 5)[0]
@@ -459,6 +467,7 @@ def _parse_track_row(page: bytes, row_base: int) -> dict:
     sample_rate = struct.unpack_from("<I", page, row_base + 8)[0]
     composer_id = struct.unpack_from("<I", page, row_base + 12)[0]
     file_size = struct.unpack_from("<I", page, row_base + 16)[0]
+    artwork_id = struct.unpack_from("<I", page, row_base + 28)[0]
     key_id = struct.unpack_from("<I", page, row_base + 32)[0]
     label_id = struct.unpack_from("<I", page, row_base + 40)[0]
     remixer_id = struct.unpack_from("<I", page, row_base + 44)[0]
@@ -487,6 +496,7 @@ def _parse_track_row(page: bytes, row_base: int) -> dict:
         "sample_rate": sample_rate,
         "composer_id": composer_id,
         "file_size": file_size,
+        "artwork_id": artwork_id,
         "key_id": key_id,
         "label_id": label_id,
         "remixer_id": remixer_id,
@@ -679,6 +689,18 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
                 f"export.pdb {label} table present but unparseable: {exc}"
             ) from exc
 
+    # --- artwork (cosmetic: a malformed table warns instead of failing) ---
+    artwork_paths: dict[int, str] = {}
+    art_bounds = _bounds(PageType.ARTWORK)
+    if art_bounds is not None:
+        try:
+            artwork_paths = _load_id_name_table(
+                data, len_page, *art_bounds, PageType.ARTWORK,
+                _parse_artwork_row, "artwork",
+            )
+        except UnsupportedFormatError as exc:
+            warnings.append(f"artwork table unreadable, rekordbox artwork skipped: {exc}")
+
     # --- tracks (required) ---
     tracks: dict[int, SourceTrack] = {}
     t_first, t_last = tables[int(PageType.TRACKS)]
@@ -737,6 +759,7 @@ def parse_export_pdb(path: Path, drive_root: Path) -> SourceLibrary:
                     beatgrid=None,
                     cues=[],
                     artwork=None,
+                    artwork_path=artwork_paths.get(int(raw["artwork_id"])) or None,
                 )
     except UnsupportedFormatError:
         raise

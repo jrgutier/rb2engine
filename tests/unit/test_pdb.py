@@ -287,6 +287,7 @@ def _track_row(
     duration: int = 180,
     bitrate: int = 320,
     file_size: int = 1_000_000,
+    artwork_id: int = 0,
     track_number: int = 1,
     disc_number: int = 1,
     play_count: int = 0,
@@ -321,6 +322,7 @@ def _track_row(
     struct.pack_into("<I", fixed, 8, sample_rate)
     struct.pack_into("<I", fixed, 12, composer_id)
     struct.pack_into("<I", fixed, 16, file_size)
+    struct.pack_into("<I", fixed, 28, artwork_id)
     struct.pack_into("<I", fixed, 32, key_id)
     struct.pack_into("<I", fixed, 40, label_id)
     struct.pack_into("<I", fixed, 44, remixer_id)
@@ -1241,3 +1243,80 @@ def test_g1d_well_formed_page_with_deleted_rows_still_parses(tmp_path: Path) -> 
     lib = parse_export_pdb(path, tmp_path)
 
     assert lib.playlists[0].track_rb_ids == [10, 20]
+
+
+# ---------------------------------------------------------------------------
+# Artwork table (page_type 13) and track.artwork_id
+# ---------------------------------------------------------------------------
+
+
+def _artwork_row(aid: int, path: str) -> bytes:
+    return _u32(aid) + _enc_short_ascii(path)
+
+
+def _pages_with_artwork(len_page: int, artwork_page: bytes | None) -> dict[int, bytes]:
+    tables = [(0, 1, 1), (7, 2, 2), (8, 3, 3)]
+    pages: dict[int, bytes] = {
+        1: _build_data_page(
+            len_page=len_page,
+            page_index=1,
+            page_type=0,
+            next_page=99,
+            row_blobs=[
+                _track_row(tid=1, title="With art", file_path="/Contents/a.mp3", artwork_id=48),
+                _track_row(tid=2, title="No art", file_path="/Contents/b.mp3"),
+                _track_row(tid=3, title="Dangling", file_path="/Contents/c.mp3", artwork_id=999),
+            ],
+        ),
+        2: _build_data_page(
+            len_page=len_page,
+            page_index=2,
+            page_type=7,
+            next_page=99,
+            row_blobs=[
+                _playlist_tree_row(parent_id=0, sort_order=0, pl_id=1, is_folder=False, name="P")
+            ],
+        ),
+        3: _build_data_page(
+            len_page=len_page, page_index=3, page_type=8, next_page=99, row_blobs=[]
+        ),
+    }
+    if artwork_page is not None:
+        tables.append((13, 4, 4))
+        pages[4] = artwork_page
+    pages[0] = _file_header(len_page=len_page, tables=tables)
+    return pages
+
+
+def test_track_artwork_path_resolved_from_artwork_table(tmp_path: Path) -> None:
+    """track.artwork_id (offset 28) joins the artwork table's path string.
+
+    WHY: rekordbox exports a cover for most tracks under PIONEER/Artwork even
+    when the audio file has none embedded; this join is the only way to it.
+    """
+    len_page = 4096
+    art_page = _build_data_page(
+        len_page=len_page,
+        page_index=4,
+        page_type=13,
+        next_page=99,
+        row_blobs=[_artwork_row(48, "/PIONEER/Artwork/00003/a48.jpg")],
+    )
+    pdb = tmp_path / "export.pdb"
+    _write_pdb(pdb, len_page, _pages_with_artwork(len_page, art_page))
+
+    lib = parse_export_pdb(pdb, tmp_path)
+
+    assert lib.tracks[1].artwork_path == "/PIONEER/Artwork/00003/a48.jpg"
+    assert lib.tracks[2].artwork_path is None  # artwork_id 0 = none
+    assert lib.tracks[3].artwork_path is None  # id with no artwork row
+
+
+def test_absent_artwork_table_leaves_artwork_path_none(tmp_path: Path) -> None:
+    len_page = 4096
+    pdb = tmp_path / "export.pdb"
+    _write_pdb(pdb, len_page, _pages_with_artwork(len_page, None))
+
+    lib = parse_export_pdb(pdb, tmp_path)
+
+    assert all(t.artwork_path is None for t in lib.tracks.values())

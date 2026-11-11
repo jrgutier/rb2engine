@@ -455,3 +455,51 @@ def test_real_stick_embedded_art_sample(tmp_path: Path) -> None:
     # Sanity: the measured stick is art-rich; a zero hit rate means the
     # extractor is broken on real files, not that the library has no covers.
     assert with_art > 0, "expected at least one embedded cover on this stick"
+
+
+# ---------------------------------------------------------------------------
+# rekordbox-exported artwork (PIONEER/Artwork) via the pdb artwork row
+# ---------------------------------------------------------------------------
+
+
+def _jpeg(tag: bytes) -> bytes:
+    """Distinct minimal JPEG-signature payloads (content only needs the magic)."""
+    return b"\xff\xd8\xff\xe0" + tag + b"\x00" * 16
+
+
+def test_pdb_artwork_prefers_medium_variant(tmp_path: Path) -> None:
+    """rekordbox writes a1.jpg (80px) and a1_m.jpg (240px); take the larger.
+
+    WHY: the 80px list thumbnail looks blurry on a deck's large jog/track
+    display, and the _m file is always exported alongside it.
+    """
+    from rb2engine.reader.artwork import extract_track_pdb_artwork, read_artwork_bytes
+
+    art_dir = tmp_path / "PIONEER" / "Artwork" / "00001"
+    art_dir.mkdir(parents=True)
+    (art_dir / "a1.jpg").write_bytes(_jpeg(b"small"))
+    (art_dir / "a1_m.jpg").write_bytes(_jpeg(b"medium"))
+
+    art = extract_track_pdb_artwork("/PIONEER/Artwork/00001/a1.jpg", tmp_path)
+
+    assert art is not None and art.source == "pdb"
+    assert read_artwork_bytes(art) == _jpeg(b"medium")
+
+
+def test_pdb_artwork_falls_back_to_small_variant(tmp_path: Path) -> None:
+    from rb2engine.reader.artwork import extract_track_pdb_artwork, read_artwork_bytes
+
+    art_dir = tmp_path / "PIONEER" / "Artwork" / "00001"
+    art_dir.mkdir(parents=True)
+    (art_dir / "a2.jpg").write_bytes(_jpeg(b"small"))
+
+    art = extract_track_pdb_artwork("/PIONEER/Artwork/00001/a2.jpg", tmp_path)
+
+    assert art is not None
+    assert read_artwork_bytes(art) == _jpeg(b"small")
+
+
+def test_pdb_artwork_missing_file_returns_none(tmp_path: Path) -> None:
+    from rb2engine.reader.artwork import extract_track_pdb_artwork
+
+    assert extract_track_pdb_artwork("/PIONEER/Artwork/00001/a3.jpg", tmp_path) is None

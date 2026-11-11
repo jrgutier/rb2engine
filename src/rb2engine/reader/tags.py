@@ -1,7 +1,7 @@
 """Built-in embedded cover-art extraction (no mutagen).
 
 Pulls raw image bytes from audio containers for the formats that matter on
-the measured stick: MP4/M4A (`covr`) and MP3 (ID3v2 APIC/PIC). FLAC PICTURE
+the measured stick: MP4/M4A (`covr`), MP3 and AIFF (ID3v2 APIC/PIC). FLAC PICTURE
 is supported when cheap. Read-only, lazy, never raises on corrupt input.
 """
 
@@ -54,6 +54,8 @@ def _extract_from_file(f: BinaryIO, path: Path) -> bytes | None:
         return _id3_cover(f)
     if len(head) >= 8 and head[4:8] == b"ftyp":
         return _mp4_cover(f)
+    if len(head) >= 12 and head[:4] == b"FORM" and head[8:12] in _AIFF_FORMS:
+        return _aiff_cover(f)
 
     # Extension fallback when magic is ambiguous (raw MPEG without ID3).
     suffix = path.suffix.lower()
@@ -63,6 +65,41 @@ def _extract_from_file(f: BinaryIO, path: Path) -> bytes | None:
         return _id3_cover(f)
     if suffix == ".flac":
         return _flac_cover(f)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# AIFF / AIFF-C
+# ---------------------------------------------------------------------------
+
+_AIFF_FORMS = (b"AIFF", b"AIFC")
+# rekordbox, iTunes and most taggers write "ID3 "; some tools use lowercase.
+_AIFF_ID3_CHUNKS = (b"ID3 ", b"id3 ")
+
+
+def _aiff_cover(f: BinaryIO) -> bytes | None:
+    """Find the ID3 chunk in an IFF FORM container and read its ID3v2 tag.
+
+    Chunk sizes are big-endian and exclude the 8-byte header; odd-sized
+    chunks are followed by one pad byte. The audio (SSND) chunk is skipped by
+    seeking, so only the chunk headers and the tag itself are read.
+    """
+    f.seek(0)
+    header = f.read(12)
+    if len(header) < 12:
+        return None
+    form_end = min(8 + struct.unpack(">I", header[4:8])[0], _file_size(f))
+    pos = 12
+    while pos + 8 <= form_end:
+        f.seek(pos)
+        chunk = f.read(8)
+        if len(chunk) < 8:
+            return None
+        chunk_id = chunk[:4]
+        size = struct.unpack(">I", chunk[4:8])[0]
+        if chunk_id in _AIFF_ID3_CHUNKS:
+            return _id3_cover(f)
+        pos += 8 + size + (size & 1)
     return None
 
 

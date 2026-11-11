@@ -1430,3 +1430,104 @@ def test_mp4_box_end_beyond_parent_stops(tmp_path: Path) -> None:
     path.write_bytes(ftyp + moov + b"\x00" * 50)
     assert embedded_cover_bytes(path) is None
 
+
+# ---------------------------------------------------------------------------
+# AIFF / AIFF-C: ID3v2 tag inside an IFF "ID3 " chunk
+# ---------------------------------------------------------------------------
+
+
+def _iff_chunk(chunk_id: bytes, payload: bytes) -> bytes:
+    """IFF chunk: id + big-endian size (excluding header) + payload + pad byte."""
+    pad = b"\x00" if len(payload) & 1 else b""
+    return chunk_id + _be32(len(payload)) + payload + pad
+
+
+def _aiff_bytes(
+    *chunks: bytes, form_type: bytes = b"AIFF", frames: int = 4410
+) -> bytes:
+    """Minimal valid AIFF: COMM (mono 16-bit 44.1 kHz) + SSND + extra chunks."""
+    # 80-bit IEEE extended for 44100.0
+    rate = b"\x40\x0e\xac\x44\x00\x00\x00\x00\x00\x00"
+    comm = struct.pack(">hIh", 1, frames, 16) + rate
+    if form_type == b"AIFC":
+        comm += b"NONE" + b"\x0enot compressed" + b"\x00"
+    ssnd = _be32(0) + _be32(0) + b"\x00" * (frames * 2)
+    body = form_type + _iff_chunk(b"COMM", comm) + _iff_chunk(b"SSND", ssnd)
+    body += b"".join(chunks)
+    return b"FORM" + _be32(len(body)) + body
+
+
+def _id3_tag(major: int, frames: list[bytes]) -> bytes:
+    body = b"".join(frames)
+    return b"ID3" + bytes([major, 0, 0]) + _syncsafe(len(body)) + body
+
+
+def test_aiff_id3_chunk_after_audio_matches_mutagen(tmp_path: Path) -> None:
+    """rekordbox/iTunes AIFFs carry the tag in an "ID3 " chunk after SSND.
+
+    WHY: AIFF is the dominant format on real DJ sticks; without this every
+    AIFF track converts with no artwork.
+    """
+    from mutagen.aiff import AIFF
+
+    path = tmp_path / "tagged.aiff"
+    path.write_bytes(_aiff_bytes())
+    audio = AIFF(path)
+    audio.add_tags()
+    audio.tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="", data=_JPEG_1X1))
+    audio.save()
+
+    _assert_matches_mutagen(path)
+    assert embedded_cover_bytes(path) == _JPEG_1X1
+
+
+@pytest.mark.parametrize("major", [3, 4])
+def test_aiff_id3_versions(tmp_path: Path, major: int) -> None:
+    frame = _apic_frame_v24(_PNG_1X1) if major == 4 else _apic_frame_v23(_PNG_1X1)
+    path = tmp_path / f"v2{major}.aiff"
+    path.write_bytes(_aiff_bytes(_iff_chunk(b"ID3 ", _id3_tag(major, [frame]))))
+    assert embedded_cover_bytes(path) == _PNG_1X1
+
+
+def test_aiff_lowercase_id3_chunk_and_aifc(tmp_path: Path) -> None:
+    path = tmp_path / "lower.aif"
+    tag = _id3_tag(4, [_apic_frame_v24(_PNG_1X1)])
+    path.write_bytes(_aiff_bytes(_iff_chunk(b"id3 ", tag), form_type=b"AIFC"))
+    assert embedded_cover_bytes(path) == _PNG_1X1
+
+
+def test_aiff_odd_sized_chunk_padding_is_skipped(tmp_path: Path) -> None:
+    """An odd-length chunk before the tag is followed by a pad byte.
+
+    WHY: forgetting the pad byte misaligns every following chunk header, so
+    the ID3 chunk is never found.
+    """
+    odd = _iff_chunk(b"NAME", b"abc")  # 3 bytes + 1 pad
+    tag = _iff_chunk(b"ID3 ", _id3_tag(4, [_apic_frame_v24(_PNG_1X1)]))
+    path = tmp_path / "odd.aiff"
+    path.write_bytes(_aiff_bytes(odd, tag))
+    assert embedded_cover_bytes(path) == _PNG_1X1
+
+
+def test_aiff_without_id3_chunk_returns_none(tmp_path: Path) -> None:
+    path = tmp_path / "plain.aiff"
+    path.write_bytes(_aiff_bytes(_iff_chunk(b"NAME", b"no art")))
+    assert embedded_cover_bytes(path) is None
+
+
+def test_aiff_truncated_chunk_returns_none_without_raising(tmp_path: Path) -> None:
+    data = _aiff_bytes(_iff_chunk(b"ID3 ", _id3_tag(4, [_apic_frame_v24(_PNG_1X1)])))
+    path = tmp_path / "trunc.aiff"
+    path.write_bytes(data[: len(data) - 60])  # cut into the tag
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = embedded_cover_bytes(path)
+    assert result is None or result == _PNG_1X1[: len(result)]
+
+
+def test_aiff_cover_is_read_without_modifying_file(tmp_path: Path) -> None:
+    path = tmp_path / "ro.aiff"
+    path.write_bytes(_aiff_bytes(_iff_chunk(b"ID3 ", _id3_tag(4, [_apic_frame_v24(_PNG_1X1)]))))
+    before = path.read_bytes()
+    embedded_cover_bytes(path)
+    assert path.read_bytes() == before

@@ -37,7 +37,7 @@ Verified on a real 3,665-track library: **3,620 tracks, 47 playlists, ~500 MB of
 | Hot cues | same pad numbers (A–H), with custom colours and names |
 | Memory cues | fill remaining pads in chronological order |
 | Saved loops | in/out points, into Engine's separate loop slots |
-| Album art | extracted from your files' embedded tags, deduplicated |
+| Album art | embedded tags (MP3, AIFF, M4A, FLAC), else rekordbox's exported `PIONEER/Artwork` cover; deduplicated |
 
 ## Install
 

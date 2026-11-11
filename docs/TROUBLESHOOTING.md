@@ -218,9 +218,11 @@ rekordbox or accept the pad cap — there is no ninth pad to map into.
 
 **Cause:**
 
-- Not every file has **embedded** artwork; rb2engine extracts from tags, it
-  does not scrape web databases or copy rekordbox's internal cache as primary
-  source.
+- The track has no cover anywhere: rb2engine uses the file's **embedded**
+  artwork (MP3, AIFF, M4A, FLAC) first, then the cover rekordbox exported to
+  `PIONEER/Artwork/` (the larger `_m` variant when present). It does not scrape
+  web databases. rekordbox itself only exports covers it found in the file's
+  tags, so a track with no embedded art usually has no exported cover either.
 - Conversion was run with artwork disabled.
 - Corrupt or unsupported tag frames are skipped (track still converts).
 

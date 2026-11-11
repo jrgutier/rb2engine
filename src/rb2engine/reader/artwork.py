@@ -15,6 +15,7 @@ from pathlib import Path
 
 from rb2engine.ir import SourceArtwork
 from rb2engine.ir_engine import artwork_content_hash
+from rb2engine.reader.paths import resolve_artwork_path
 from rb2engine.reader.tags import embedded_cover_bytes
 
 SOURCE_EMBEDDED = "embedded"
@@ -92,6 +93,22 @@ def extract_pdb_artwork(image_path: Path) -> SourceArtwork | None:
         path=path,
         source=SOURCE_PDB,
     )
+
+
+def extract_track_pdb_artwork(raw_path: str, drive_root: Path) -> SourceArtwork | None:
+    """Resolve a track's pdb artwork row (``/PIONEER/Artwork/…/a1.jpg``).
+
+    rekordbox exports each cover twice: ``a1.jpg`` (80×80, for CDJ lists) and
+    ``a1_m.jpg`` (240×240). The larger one is preferred; the small one is the
+    fallback when an export has no ``_m`` variant.
+    """
+    stem, dot, ext = raw_path.rpartition(".")
+    candidates = [f"{stem}_m.{ext}", raw_path] if dot else [raw_path]
+    for candidate in candidates:
+        resolved = resolve_artwork_path(candidate, drive_root)
+        if resolved is not None:
+            return extract_pdb_artwork(resolved)
+    return None
 
 
 def read_artwork_bytes(art: SourceArtwork) -> bytes | None:

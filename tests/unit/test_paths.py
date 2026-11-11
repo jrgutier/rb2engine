@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from rb2engine.reader.paths import resolve_track_path
 
 
@@ -240,3 +242,35 @@ def test_returns_concrete_filesystem_path(tmp_path: Path) -> None:
     assert isinstance(result, Path)
     assert result.exists()
     assert result.is_file()
+
+
+# ---------------------------------------------------------------------------
+# resolve_artwork_path
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_artwork_path_case_insensitive(tmp_path: Path) -> None:
+    from rb2engine.reader.paths import resolve_artwork_path
+
+    target = tmp_path / "PIONEER" / "Artwork" / "00001" / "a1.jpg"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"x")
+    assert resolve_artwork_path("/pioneer/artwork/00001/A1.JPG", tmp_path) == target
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "/Contents/a1.jpg",                       # outside PIONEER/Artwork
+        "/PIONEER/Artwork/../../etc/passwd",      # traversal
+        "/PIONEER/Artwork/00001/missing.jpg",     # absent
+        "",
+    ],
+)
+def test_resolve_artwork_path_rejects(tmp_path: Path, raw: str) -> None:
+    from rb2engine.reader.paths import resolve_artwork_path
+
+    (tmp_path / "PIONEER" / "Artwork" / "00001").mkdir(parents=True)
+    (tmp_path / "Contents").mkdir()
+    (tmp_path / "Contents" / "a1.jpg").write_bytes(b"x")
+    assert resolve_artwork_path(raw, tmp_path) is None

@@ -48,6 +48,7 @@ def _track(
     beatgrid: SourceBeatgrid | None = None,
     cues: list[SourceCue] | None = None,
     artwork: SourceArtwork | None = None,
+    artwork_path: str | None = None,
 ) -> SourceTrack:
     """Hand-authored minimal track for orchestration tests."""
     return SourceTrack(
@@ -79,6 +80,7 @@ def _track(
         cues=list(cues) if cues is not None else [],
         artwork=artwork,
         analyze_path=analyze_path,
+        artwork_path=artwork_path,
     )
 
 
@@ -126,6 +128,7 @@ def _patch_orchestration(
     resolve: Any = None,
     read_anlz: Any = None,
     extract_artwork: Any = None,
+    extract_pdb_art: Any = None,
 ) -> dict[str, MagicMock]:
     """Wire fakes into reader.library so only the join logic runs."""
     import rb2engine.reader.library as library_mod
@@ -140,12 +143,18 @@ def _patch_orchestration(
     mocks["extract_artwork"] = (
         extract_artwork if extract_artwork is not None else MagicMock(return_value=None)
     )
+    mocks["extract_track_pdb_artwork"] = (
+        extract_pdb_art if extract_pdb_art is not None else MagicMock(return_value=None)
+    )
 
     monkeypatch.setattr(library_mod, "scan_drive", mocks["scan_drive"])
     monkeypatch.setattr(library_mod, "parse_export_pdb", mocks["parse_export_pdb"])
     monkeypatch.setattr(library_mod, "resolve_anlz_paths", mocks["resolve_anlz_paths"])
     monkeypatch.setattr(library_mod, "read_anlz", mocks["read_anlz"])
     monkeypatch.setattr(library_mod, "extract_artwork", mocks["extract_artwork"])
+    monkeypatch.setattr(
+        library_mod, "extract_track_pdb_artwork", mocks["extract_track_pdb_artwork"]
+    )
     return mocks
 
 
@@ -713,3 +722,69 @@ def test_real_stick_end_to_end_join() -> None:
 
     sample = with_anlz_path[0].analyze_path
     assert sample is not None and "USBANLZ" in sample
+
+
+def test_pdb_artwork_fills_in_when_no_embedded_cover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No embedded art → rekordbox's exported cover is used instead.
+
+    WHY: on a real stick most AIFF files carry no embedded picture, yet
+    rekordbox exported a cover for them; Engine's own import shows it.
+    """
+    from rb2engine.reader.library import read_library
+
+    drive = tmp_path / "stick"
+    audio = drive / "Contents" / "song.aiff"
+    track = _track(7, resolved_path=audio, artwork_path="/PIONEER/Artwork/00001/a7.jpg")
+    pdb_art = SourceArtwork(content_key="pdb7", path=None, source="pdb")
+    mocks = _patch_orchestration(
+        monkeypatch,
+        drive=drive,
+        lib=_base_lib(drive, {7: track}),
+        extract_pdb_art=MagicMock(return_value=pdb_art),
+    )
+
+    result = read_library(drive, with_anlz=False, with_artwork=True)
+
+    mocks["extract_track_pdb_artwork"].assert_called_once_with(
+        "/PIONEER/Artwork/00001/a7.jpg", drive
+    )
+    assert result.tracks[7].artwork == pdb_art
+
+
+def test_embedded_cover_wins_over_pdb_artwork(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rb2engine.reader.library import read_library
+
+    drive = tmp_path / "stick"
+    audio = drive / "Contents" / "song.mp3"
+    track = _track(8, resolved_path=audio, artwork_path="/PIONEER/Artwork/00001/a8.jpg")
+    embedded = SourceArtwork(content_key="emb8", path=audio, source="embedded")
+    mocks = _patch_orchestration(
+        monkeypatch,
+        drive=drive,
+        lib=_base_lib(drive, {8: track}),
+        extract_artwork=MagicMock(return_value=embedded),
+    )
+
+    result = read_library(drive, with_anlz=False, with_artwork=True)
+
+    mocks["extract_track_pdb_artwork"].assert_not_called()
+    assert result.tracks[8].artwork == embedded
+
+
+def test_no_artwork_flag_skips_pdb_artwork_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rb2engine.reader.library import read_library
+
+    drive = tmp_path / "stick"
+    track = _track(9, analyze_path="/PIONEER/USBANLZ/P000/0000/ANLZ0000.DAT",
+                   artwork_path="/PIONEER/Artwork/00001/a9.jpg")
+    mocks = _patch_orchestration(monkeypatch, drive=drive, lib=_base_lib(drive, {9: track}))
+
+    read_library(drive, with_anlz=True, with_artwork=False)
+
+    mocks["extract_track_pdb_artwork"].assert_not_called()
